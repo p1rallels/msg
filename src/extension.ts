@@ -80,6 +80,8 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	const root = msgRoot(process.env);
 	const home = homedir();
 	let live: Live | undefined;
+	/** Why msg couldn't start in this session, for the tools to explain. */
+	let unavailable: string | undefined;
 
 	const notify = (current: Live, text: string, level: "info" | "warning" | "error"): void => {
 		try {
@@ -171,6 +173,24 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		}
 	};
 
+	const isStale = (current: Live): boolean => {
+		try {
+			current.ctx.isIdle();
+			return false;
+		} catch {
+			return true;
+		}
+	};
+
+	/** Stops when pi disposed the session; otherwise logs and lets the next tick retry. */
+	const handleFailure = (current: Live, error: unknown): void => {
+		if (isStale(current)) {
+			stop();
+			return;
+		}
+		console.error(`[msg] delivery failed, retrying: ${error instanceof Error ? error.message : String(error)}`);
+	};
+
 	const pump = (current: Live): void => {
 		if (live !== current) return;
 		try {
@@ -180,9 +200,9 @@ export default function msgExtension(pi: ExtensionAPI): void {
 				deliver: (message) => inject(current, message),
 			});
 			if (report.invalid.length > 0) notify(current, `msg: skipped ${report.invalid.length} unreadable message file(s)`, "warning");
-			if (report.failure !== undefined) stop();
-		} catch {
-			stop();
+			if (report.failure !== undefined) handleFailure(current, report.failure);
+		} catch (error) {
+			handleFailure(current, error);
 		}
 	};
 
@@ -244,10 +264,9 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const start = (ctx: ExtensionContext): void => {
-		stop();
+	const begin = (ctx: ExtensionContext): void => {
 		const id = ctx.sessionManager.getSessionId();
-		if (!isValidId(id)) return;
+		if (!isValidId(id)) throw new Error(`session id ${JSON.stringify(id)} can't name a mailbox`);
 		ensureMailbox(root, id);
 		const now = Date.now();
 		const name = normalizeName(pi.getSessionName());
@@ -263,6 +282,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			startedAt: now,
 			heartbeatAt: now,
 		};
+		writePresence(root, presence);
 		const timer = setInterval(() => {
 			if (live) tick(live);
 		}, TICK_MS);
@@ -282,7 +302,6 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			status: undefined,
 		};
 		live = current;
-		savePresence(current, presence);
 		current.watcher = watchInbox(current);
 		try {
 			updateStatus(current, now);
@@ -292,9 +311,22 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		housekeeping(id, now);
 	};
 
+	const start = (ctx: ExtensionContext): void => {
+		stop();
+		unavailable = undefined;
+		try {
+			begin(ctx);
+		} catch (error) {
+			stop();
+			const reason = error instanceof Error ? error.message : String(error);
+			unavailable = `msg can't use its store at ${root}: ${reason}. In a walled pfs fork, create it with \`pfs new <name> --allow ${root}\`.`;
+			console.error(`[msg] ${unavailable}`);
+		}
+	};
+
 	const requireLive = (): Live => {
-		if (!live) throw new Error("msg is not running in this session (it starts with the session; try again in a moment)");
-		return live;
+		if (live) return live;
+		throw new Error(unavailable ?? "msg is not running in this session (it starts with the session; try again in a moment)");
 	};
 
 	pi.on("session_start", (_event, ctx) => start(ctx));
