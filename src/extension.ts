@@ -16,6 +16,7 @@ import { canAnswer, findRecipient, post } from "./core/send.ts";
 import { createWaiters, isFrom, isReplyTo, type Waiters, type WaitOutcome } from "./core/waiters.ts";
 
 const CUSTOM_TYPE = "msg";
+const STATUS_KEY = "msg";
 const TICK_MS = 2_000;
 const PUMP_DEBOUNCE_MS = 25;
 const STARTUP_GRACE_MS = 3_000;
@@ -37,6 +38,9 @@ interface Live {
 	watcher: FSWatcher | undefined;
 	wakes: number[];
 	pumpQueued: boolean;
+	/** Messages whose sender is blocked waiting for our reply: id -> who and until when. */
+	awaited: Map<string, { readonly from: string; readonly until: number }>;
+	status: string | undefined;
 }
 
 type ToolText = { type: "text"; text: string };
@@ -101,6 +105,11 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		clearInterval(current.timer);
 		current.watcher?.close();
 		current.waiters.cancelAll();
+		try {
+			if (current.status !== undefined) current.ctx.ui.setStatus(STATUS_KEY, undefined);
+		} catch {
+			// the ctx is already gone
+		}
 		savePresence(current, { ...current.presence, activity: "idle", endedAt: Date.now() });
 	};
 
@@ -119,6 +128,28 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		return deliveryAction(state, "steer").kind !== "hold";
 	};
 
+	const rememberAwaited = (current: Live, message: Message, now: number): void => {
+		for (const [id, entry] of current.awaited) if (entry.until <= now) current.awaited.delete(id);
+		if (message.awaitingUntil !== undefined && message.awaitingUntil > now) current.awaited.set(message.id, { from: message.from.id, until: message.awaitingUntil });
+	};
+
+	/** True when `replyTo` names a message whose sender (`to`) is still blocked waiting on it. Forgets it either way. */
+	const takeAwaited = (current: Live, replyTo: string | undefined, to: string, now: number): boolean => {
+		const entry = replyTo ? current.awaited.get(replyTo) : undefined;
+		if (!entry || !replyTo) return false;
+		current.awaited.delete(replyTo);
+		return entry.from === to && entry.until > now;
+	};
+
+	const updateStatus = (current: Live, now: number): void => {
+		if (!current.ctx.hasUI) return;
+		const peers = directory(listPresence(root), now).live.filter((record) => record.id !== current.id).length;
+		const text = `✉ ${partyLabel(current.presence)}${peers > 0 ? ` · ${peers} live` : ""}`;
+		if (text === current.status) return;
+		current.status = text;
+		current.ctx.ui.setStatus(STATUS_KEY, text);
+	};
+
 	const inject = (current: Live, message: Message): "delivered" | "held" => {
 		const now = Date.now();
 		const action = deliveryAction(sessionState(current, now), message.delivery);
@@ -128,10 +159,12 @@ export default function msgExtension(pi: ExtensionAPI): void {
 				return "held";
 			case "append":
 				pi.sendMessage(custom, { triggerTurn: false });
+				rememberAwaited(current, message, now);
 				notify(current, `msg: ${partyLabel(message.from)} wrote, but this session woke ${DEFAULT_WAKE_BUDGET.max}x without you; not waking it again until you prompt`, "warning");
 				return "delivered";
 			case "inject":
 				pi.sendMessage(custom, { triggerTurn: true, deliverAs: action.deliverAs });
+				rememberAwaited(current, message, now);
 				if (action.wakes) current.wakes = [...recentWakes(current.wakes, now, DEFAULT_WAKE_BUDGET), now];
 				return "delivered";
 		}
@@ -178,6 +211,11 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		const { presence } = current;
 		if (activity !== presence.activity || name !== presence.name || now - presence.heartbeatAt >= HEARTBEAT_EVERY_MS) {
 			savePresence(current, { ...withName(presence, name), activity, heartbeatAt: now });
+			try {
+				updateStatus(current, now);
+			} catch {
+				// a status line is cosmetic
+			}
 		}
 		pump(current);
 	};
@@ -228,10 +266,28 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			if (live) tick(live);
 		}, TICK_MS);
 		timer.unref?.();
-		const current: Live = { id, ctx, mode, startedAt: now, waiters: createWaiters(), timer, presence, watcher: undefined, wakes: [], pumpQueued: false };
+		const current: Live = {
+			id,
+			ctx,
+			mode,
+			startedAt: now,
+			waiters: createWaiters(),
+			timer,
+			presence,
+			watcher: undefined,
+			wakes: [],
+			pumpQueued: false,
+			awaited: new Map(),
+			status: undefined,
+		};
 		live = current;
 		savePresence(current, presence);
 		current.watcher = watchInbox(current);
+		try {
+			updateStatus(current, now);
+		} catch {
+			// a status line is cosmetic
+		}
 		housekeeping(id, now);
 	};
 
@@ -331,7 +387,9 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			);
 			if (!posted.ok) throw new Error(posted.error);
 			const message = posted.value;
-			const summary = `Sent ${message.id} to ${targetLabel(target)}: ${expectation(target, delivery, now)}.`;
+			const waiting = takeAwaited(current, message.replyTo, target.presence.id, now);
+			const when = waiting ? "it is blocked waiting for this reply and gets it right away" : expectation(target, delivery, now);
+			const summary = `Sent ${message.id} to ${targetLabel(target)}: ${when}.`;
 			if (waitSeconds === 0) {
 				const note = requestedWait > 0 ? " Not waiting: nobody there can answer right now." : "";
 				return { content: toolText(`${summary}${note}`), details: { message, to: target.presence.id, live: target.live } };
@@ -372,6 +430,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			const outcome = await waiting;
 			switch (outcome.kind) {
 				case "message":
+					rememberAwaited(current, outcome.message, Date.now());
 					return {
 						content: toolText(renderForAgent(outcome.message, Date.now())),
 						details: { from: senderId, message: outcome.message, outcome: outcome.kind },

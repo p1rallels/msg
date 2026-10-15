@@ -1,6 +1,6 @@
 import { type AgentSession, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { readPresence } from "../src/core/registry.ts";
-import { type Check, check, cli, customMessages, EXTENSION, MODEL, piArgs, presenceNamed, REPO, report, sessionEntries, sleep, spawnPi, THINKING, toolCalls, waitUntil, type World, world } from "./lib.ts";
+import { type Check, check, cli, customMessages, EXTENSION, MODEL, piArgs, presenceNamed, REPO, report, sessionEntries, sleep, spawnPi, THINKING, toolCalls, toolResults, waitUntil, type World, world } from "./lib.ts";
 
 const ONLINE_TIMEOUT_MS = 45_000;
 const STARTUP_GRACE_MS = 3_500;
@@ -74,6 +74,11 @@ export const headlessPair = async (): Promise<boolean> => {
 			check("alice blocked on msg_send with wait_seconds", aliceSends.some((args) => (args.wait_seconds ?? 0) > 0), JSON.stringify(aliceSends)),
 			check("bob received it through msg_wait", toolCalls(bobEntries, "msg_wait").length >= 1),
 			check("bob answered with reply_to", bobSends.some((args) => Boolean(args.reply_to)), JSON.stringify(bobSends)),
+			check(
+				"bob was told alice is blocked on his reply",
+				toolResults(bobEntries, "msg_send").some((text) => text.includes("blocked waiting for this reply")),
+				toolResults(bobEntries, "msg_send").join("\n"),
+			),
 			check("bob's reply went to alice's tool result, not into her conversation", customMessages(aliceEntries).length === 0),
 		);
 	} catch (error) {

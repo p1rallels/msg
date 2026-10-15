@@ -127,6 +127,13 @@ export const toolCalls = (entries: readonly Record<string, unknown>[], tool: str
 		return (message.content ?? []).filter((part) => part.type === "toolCall" && part.name === tool).map((part) => part.arguments);
 	});
 
+export const toolResults = (entries: readonly Record<string, unknown>[], tool: string): string[] =>
+	entries.flatMap((entry) => {
+		const message = entry.message as { role?: string; toolName?: string; content?: { type?: string; text?: string }[] } | undefined;
+		if (entry.type !== "message" || message?.role !== "toolResult" || message.toolName !== tool) return [];
+		return (message.content ?? []).flatMap((part) => (part.type === "text" && part.text ? [part.text] : []));
+	});
+
 export const customMessages = (entries: readonly Record<string, unknown>[]): Record<string, unknown>[] =>
 	entries.filter((entry) => entry.type === "custom_message" && entry.customType === "msg");
 
