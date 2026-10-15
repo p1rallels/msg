@@ -20,7 +20,8 @@
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",
 		"check": "tsc --noEmit && bun test",
-		"msg": "bun src/cli.ts"
+		"msg": "bun src/cli.ts",
+		"e2e": "bun e2e/run.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",

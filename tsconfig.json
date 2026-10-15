@@ -17,5 +17,5 @@
 		"resolveJsonModule": true,
 		"isolatedModules": true
 	},
-	"include": ["src", "test"]
+	"include": ["src", "test", "e2e"]
 }
