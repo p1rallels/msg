@@ -11,16 +11,21 @@ export type DeliveryAction =
 
 export interface SessionState {
 	readonly mode: Mode;
+	/** No run, compaction or queued continuation. */
 	readonly idle: boolean;
+	/** The agent loop is running, so a message can be steered or queued into it. */
+	readonly streaming: boolean;
 	readonly wakeAllowed: boolean;
 }
 
 /**
  * Print and JSON runs take their prompt after the session starts and exit when it settles, so a
- * message must never start a run there: it only joins a run that's already going.
+ * message must never start a run there: it only joins a run that's already going. A session busy
+ * with something other than its agent loop (a manual compaction, a run still starting) holds the
+ * message for the next pump instead of starting a second run.
  */
 export const deliveryAction = (state: SessionState, delivery: Delivery): DeliveryAction => {
-	if (!state.idle) return { kind: "inject", deliverAs: delivery, wakes: false };
+	if (!state.idle) return state.streaming ? { kind: "inject", deliverAs: delivery, wakes: false } : { kind: "hold" };
 	if (state.mode === "print" || state.mode === "json") return { kind: "hold" };
 	if (!state.wakeAllowed) return { kind: "append" };
 	return { kind: "inject", deliverAs: delivery, wakes: true };

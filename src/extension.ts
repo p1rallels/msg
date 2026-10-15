@@ -117,6 +117,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	const sessionState = (current: Live, now: number): SessionState => ({
 		mode: current.mode,
 		idle: current.ctx.isIdle(),
+		streaming: current.ctx.signal !== undefined,
 		wakeAllowed: wakeAllowed(current.wakes, now, DEFAULT_WAKE_BUDGET),
 	});
 

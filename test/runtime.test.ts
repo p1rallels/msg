@@ -60,19 +60,23 @@ describe("waiters", () => {
 });
 
 describe("deliveryAction", () => {
-	test("busy sessions get it steered or queued, never woken", () => {
-		expect(deliveryAction({ mode: "print", idle: false, wakeAllowed: false }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: false });
-		expect(deliveryAction({ mode: "tui", idle: false, wakeAllowed: true }, "followUp")).toEqual({ kind: "inject", deliverAs: "followUp", wakes: false });
+	test("running sessions get it steered or queued, never woken", () => {
+		expect(deliveryAction({ mode: "print", idle: false, streaming: true, wakeAllowed: false }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: false });
+		expect(deliveryAction({ mode: "tui", idle: false, streaming: true, wakeAllowed: true }, "followUp")).toEqual({ kind: "inject", deliverAs: "followUp", wakes: false });
+	});
+
+	test("busy but not streaming (compacting, run still starting) holds it for the next pump", () => {
+		expect(deliveryAction({ mode: "tui", idle: false, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
 	});
 
 	test("idle print/json runs hold it; they'd break if a message started a run", () => {
-		expect(deliveryAction({ mode: "print", idle: true, wakeAllowed: true }, "steer").kind).toBe("hold");
-		expect(deliveryAction({ mode: "json", idle: true, wakeAllowed: true }, "steer").kind).toBe("hold");
+		expect(deliveryAction({ mode: "print", idle: true, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
+		expect(deliveryAction({ mode: "json", idle: true, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
 	});
 
 	test("idle interactive sessions wake, unless the wake budget is spent", () => {
-		expect(deliveryAction({ mode: "web", idle: true, wakeAllowed: true }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: true });
-		expect(deliveryAction({ mode: "tui", idle: true, wakeAllowed: false }, "steer").kind).toBe("append");
+		expect(deliveryAction({ mode: "web", idle: true, streaming: false, wakeAllowed: true }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: true });
+		expect(deliveryAction({ mode: "tui", idle: true, streaming: false, wakeAllowed: false }, "steer").kind).toBe("append");
 	});
 
 	test("wake budget counts only wakes inside the window", () => {
