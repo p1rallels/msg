@@ -19,7 +19,7 @@ const fileName = (message: Message): string => `${message.id}.json`;
 export const deliver = (root: string, message: Message): string => {
 	const dirs = ensureMailbox(root, message.to);
 	const target = join(dirs.new, fileName(message));
-	writeFileAtomic(target, `${JSON.stringify(message)}\n`, dirs.tmp);
+	writeFileAtomic(target, `${JSON.stringify(message)}\n`, { tmpDir: dirs.tmp, durable: true });
 	return target;
 };
 

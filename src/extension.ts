@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { expectation, formatDirectory, targetLabel } from "./core/format.ts";
+import { sweepOrphans } from "./core/housekeeping.ts";
 import { ensureMailbox, pruneDelivered } from "./core/maildir.ts";
 import { type Delivery, type Message, normalizeName, partyLabel, renderForAgent } from "./core/message.ts";
 import { isValidId, mailboxDirs, msgRoot } from "./core/paths.ts";
@@ -198,6 +199,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		try {
 			pruneDelivered(root, id, now, DELIVERED_TTL_MS);
 			pruneOffline(root, now, OFFLINE_TTL_MS);
+			sweepOrphans(root, now);
 		} catch {
 			// best effort; a later session retries
 		}
