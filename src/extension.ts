@@ -312,7 +312,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			const now = Date.now();
 			const from = { id: current.id, ...(current.presence.name ? { name: current.presence.name } : {}), cwd: current.presence.cwd };
 			const found = findRecipient(root, from, params.to, now);
-			if (!found.ok) throw new Error(found.error);
+			if (!found.ok) throw new Error(`${found.error}. msg_list shows who's around.`);
 			const target = found.value;
 			const waitSeconds = canAnswer(target) ? requestedWait : 0;
 			const posted = post(
@@ -361,7 +361,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			const current = requireLive();
 			const timeoutSeconds = clampSeconds(params.timeout_seconds, DEFAULT_WAIT_SECONDS) || DEFAULT_WAIT_SECONDS;
 			const sender = params.from?.trim() ? findRecipient(root, { id: current.id }, params.from, Date.now()) : undefined;
-			if (sender && !sender.ok) throw new Error(sender.error);
+			if (sender && !sender.ok) throw new Error(`${sender.error}. msg_list shows who's around.`);
 			const senderId = sender?.ok ? sender.value.presence.id : undefined;
 			const who = sender?.ok ? targetLabel(sender.value) : "anyone";
 			onUpdate?.({ content: toolText(`Waiting up to ${timeoutSeconds}s for a message from ${who}…`), details: { from: senderId } });

@@ -47,5 +47,5 @@ export const resolveTarget = (rawQuery: string, dir: Directory): Result<Target> 
 	if (offlineName) return target(offlineName, false, "name");
 
 	const known = dir.live.length > 0 ? `live sessions: ${describe(dir.live)}` : "no live sessions right now";
-	return fail(`no session matches "${query}" (${known}). msg_list shows who's around.`);
+	return fail(`no session matches "${query}" (${known})`);
 };
