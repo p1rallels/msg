@@ -6,8 +6,11 @@ export interface PumpHooks {
 	readonly accepting: () => boolean;
 	/** A waiting tool call gets first pick. True when one took the message. */
 	readonly offer: (message: Message) => boolean;
-	/** Puts the message into the session. Throws when the session is gone; the message goes back. */
-	readonly deliver: (message: Message) => void;
+	/**
+	 * Puts the message into the session, or says to keep it for later (`held`). Throws when the
+	 * session is gone. Either way the message goes back to the inbox and the pump stops.
+	 */
+	readonly deliver: (message: Message) => "delivered" | "held";
 }
 
 export interface PumpReport {
@@ -35,7 +38,10 @@ export const pumpOnce = (root: string, id: string, hooks: PumpHooks): PumpReport
 			continue;
 		}
 		try {
-			hooks.deliver(claimed.message);
+			if (hooks.deliver(claimed.message) === "held") {
+				unclaim(root, id, file);
+				return { delivered, offered, invalid };
+			}
 			delivered.push(claimed.message);
 		} catch (failure) {
 			unclaim(root, id, file);

@@ -102,7 +102,7 @@ describe("pumpOnce", () => {
 	test("delivers oldest first and empties the inbox", () => {
 		seed(3);
 		const seen: string[] = [];
-		const report = pumpOnce(root, "me", { accepting: () => true, offer: () => false, deliver: (m) => seen.push(m.text) });
+		const report = pumpOnce(root, "me", { accepting: () => true, offer: () => false, deliver: (m) => (seen.push(m.text), "delivered") });
 		expect(seen).toEqual(["m0", "m1", "m2"]);
 		expect(report.delivered.length).toBe(3);
 		expect(pending(root, "me")).toEqual([]);
@@ -111,14 +111,14 @@ describe("pumpOnce", () => {
 	test("waiters get first pick", () => {
 		seed(2);
 		const seen: string[] = [];
-		const report = pumpOnce(root, "me", { accepting: () => true, offer: (m) => m.text === "m0", deliver: (m) => seen.push(m.text) });
+		const report = pumpOnce(root, "me", { accepting: () => true, offer: (m) => m.text === "m0", deliver: (m) => (seen.push(m.text), "delivered") });
 		expect(report.offered.map((m) => m.text)).toEqual(["m0"]);
 		expect(seen).toEqual(["m1"]);
 	});
 
 	test("not accepting leaves everything pending", () => {
 		seed(2);
-		const report = pumpOnce(root, "me", { accepting: () => false, offer: () => false, deliver: () => {} });
+		const report = pumpOnce(root, "me", { accepting: () => false, offer: () => false, deliver: () => "delivered" });
 		expect(report.delivered).toEqual([]);
 		expect(pending(root, "me").length).toBe(2);
 	});
@@ -130,10 +130,19 @@ describe("pumpOnce", () => {
 			offer: () => false,
 			deliver: (m) => {
 				if (m.text === "m1") throw new Error("session gone");
+				return "delivered";
 			},
 		});
 		expect(report.delivered.map((m) => m.text)).toEqual(["m0"]);
 		expect(String(report.failure)).toContain("session gone");
+		expect(pending(root, "me").length).toBe(2);
+	});
+
+	test("held puts the message back and stops without a failure", () => {
+		seed(2);
+		const report = pumpOnce(root, "me", { accepting: () => true, offer: () => false, deliver: () => "held" });
+		expect(report.delivered).toEqual([]);
+		expect(report.failure).toBeUndefined();
 		expect(pending(root, "me").length).toBe(2);
 	});
 });
