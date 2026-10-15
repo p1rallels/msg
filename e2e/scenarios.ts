@@ -1,5 +1,6 @@
+import { type AgentSession, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { readPresence } from "../src/core/registry.ts";
-import { type Check, check, cli, customMessages, piArgs, presenceNamed, report, sessionEntries, sleep, spawnPi, toolCalls, waitUntil, world } from "./lib.ts";
+import { type Check, check, cli, customMessages, EXTENSION, MODEL, piArgs, presenceNamed, REPO, report, sessionEntries, sleep, spawnPi, THINKING, toolCalls, waitUntil, type World, world } from "./lib.ts";
 
 const ONLINE_TIMEOUT_MS = 45_000;
 const STARTUP_GRACE_MS = 3_500;
@@ -119,4 +120,69 @@ export const steerBusy = async (): Promise<boolean> => {
 	return report("steer busy: a message reaches a pi -p run mid-task", checks);
 };
 
-export const SCENARIOS = { rpcWake, headlessPair, steerBusy } as const;
+const openHostedSession = async (w: World, modelRuntime: ModelRuntime, name: string): Promise<AgentSession> => {
+	const [provider, ...rest] = MODEL.split("/");
+	const model = modelRuntime.getModel(provider ?? "", rest.join("/"));
+	if (!model) throw new Error(`model ${MODEL} not found`);
+	const resourceLoader = new DefaultResourceLoader({ cwd: REPO, agentDir: getAgentDir(), noExtensions: true, noSkills: true, additionalExtensionPaths: [EXTENSION] });
+	await resourceLoader.reload();
+	const { session } = await createAgentSession({
+		cwd: REPO,
+		sessionManager: SessionManager.create(REPO, w.sessions),
+		modelRuntime,
+		model,
+		thinkingLevel: THINKING === "low" ? "low" : "medium",
+		resourceLoader,
+	});
+	session.setSessionName(name);
+	await session.bindExtensions({ mode: "rpc" });
+	return session;
+};
+
+/**
+ * pi-web's shape: several SDK sessions in one Bun process, each with its own copy of the extension,
+ * disposed with session.dispose() and no session_shutdown.
+ */
+export const webHost = async (): Promise<boolean> => {
+	const w = world("web");
+	const checks: Check[] = [];
+	const previousRoot = process.env.PI_MSG_DIR;
+	process.env.PI_MSG_DIR = w.store;
+	const sessions: AgentSession[] = [];
+	try {
+		const modelRuntime = await ModelRuntime.create();
+		const a = await openHostedSession(w, modelRuntime, "web-a");
+		sessions.push(a);
+		const b = await openHostedSession(w, modelRuntime, "web-b");
+		sessions.push(b);
+		const recordA = await waitUntil("web-a online", () => presenceNamed(w, "web-a"), 10_000);
+		const recordB = await waitUntil("web-b online", () => presenceNamed(w, "web-b"), 10_000);
+		await sleep(STARTUP_GRACE_MS);
+		const asked = await cli(w, ["send", "web-a", "What is 3+4? Answer with just the number.", "--wait", "120", "--as", "main"], { MSG_ID: "e2e-main" });
+		const stillB = readPresence(w.store, recordB.id);
+		b.dispose();
+		const endedB = await waitUntil("web-b marked ended after dispose", () => readPresence(w.store, recordB.id)?.endedAt, 8_000).catch(() => undefined);
+		const aAfterB = readPresence(w.store, recordA.id);
+		a.dispose();
+		const endedA = await waitUntil("web-a marked ended after dispose", () => readPresence(w.store, recordA.id)?.endedAt, 8_000).catch(() => undefined);
+		checks.push(
+			check("two sessions, one process, separate identities", recordA.id !== recordB.id && recordA.pid === recordB.pid && recordA.pid === process.pid),
+			check("msg send --wait gets the hosted session's answer", asked.code === 0 && /\b7\b/.test(asked.stdout), clip(asked.stdout + asked.stderr)),
+			check("only web-a was woken", customMessages(sessionEntries(w, recordB.id)).length === 0 && customMessages(sessionEntries(w, recordA.id)).length === 1),
+			check("web-b stayed live until disposed", stillB?.endedAt === undefined),
+			check("dispose() without session_shutdown still ends web-b's presence", endedB !== undefined),
+			check("web-a unaffected by web-b's dispose", aAfterB?.endedAt === undefined),
+			check("web-a ends too once disposed", endedA !== undefined),
+		);
+	} catch (error) {
+		checks.push(check("scenario ran", false, String(error)));
+	} finally {
+		for (const session of sessions) session.dispose();
+		if (previousRoot === undefined) delete process.env.PI_MSG_DIR;
+		else process.env.PI_MSG_DIR = previousRoot;
+		w.dispose();
+	}
+	return report("web host: two SDK sessions in one Bun process, disposed pi-web style", checks);
+};
+
+export const SCENARIOS = { rpcWake, headlessPair, steerBusy, webHost } as const;
