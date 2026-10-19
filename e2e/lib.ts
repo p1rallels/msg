@@ -11,6 +11,7 @@ export const MODEL = process.env.E2E_MODEL ?? "anthropic/claude-haiku-5-5";
 export const THINKING = process.env.E2E_THINKING ?? "low";
 
 export interface World {
+	readonly base: string;
 	readonly store: string;
 	readonly sessions: string;
 	readonly env: Record<string, string>;
@@ -31,6 +32,7 @@ export const world = (label: string): World => {
 	delete env.PI_SESSION_FILE;
 	const children: Subprocess[] = [];
 	return {
+		base,
 		store,
 		sessions,
 		env: { ...env, PI_MSG_DIR: store },
@@ -97,8 +99,8 @@ export interface Run {
  * Starts pi in the scenario's world. stdin is a pipe: RPC mode reads commands from it, and
  * print mode waits for its EOF before prompting, so `-p` runs get it closed right away.
  */
-export const spawnPi = (w: World, args: readonly string[], cwd = REPO): Run => {
-	const proc = Bun.spawn(args as string[], { cwd, env: w.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+export const spawnPi = (w: World, args: readonly string[], cwd = REPO, env: Record<string, string> = {}): Run => {
+	const proc = Bun.spawn(args as string[], { cwd, env: { ...w.env, ...env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 	w.children.push(proc);
 	if (!args.includes("rpc")) proc.stdin.end();
 	const done = Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]).then(([stdout, stderr, code]) => ({
@@ -133,6 +135,20 @@ export const toolResults = (entries: readonly Record<string, unknown>[], tool: s
 		if (entry.type !== "message" || message?.role !== "toolResult" || message.toolName !== tool) return [];
 		return (message.content ?? []).flatMap((part) => (part.type === "text" && part.text ? [part.text] : []));
 	});
+
+/** The `details` of each result of `tool`, oldest first. */
+export const toolDetails = (entries: readonly Record<string, unknown>[], tool: string): Record<string, unknown>[] =>
+	entries.flatMap((entry) => {
+		const message = entry.message as { role?: string; toolName?: string; details?: unknown } | undefined;
+		if (entry.type !== "message" || message?.role !== "toolResult" || message.toolName !== tool) return [];
+		return typeof message.details === "object" && message.details !== null ? [message.details as Record<string, unknown>] : [];
+	});
+
+/** Sends one RPC command to a `--mode rpc` pi. */
+export const rpc = (run: Run, command: Record<string, unknown>): void => {
+	run.proc.stdin.write(`${JSON.stringify(command)}\n`);
+	run.proc.stdin.flush();
+};
 
 export const customMessages = (entries: readonly Record<string, unknown>[]): Record<string, unknown>[] =>
 	entries.filter((entry) => entry.type === "custom_message" && entry.customType === "msg");
