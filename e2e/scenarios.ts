@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import { allMessages } from "../src/core/maildir.ts";
 import type { Message } from "../src/core/message.ts";
-import { readPresence } from "../src/core/registry.ts";
+import { type Presence, readPresence } from "../src/core/registry.ts";
 import {
 	type Check,
 	check,
@@ -15,6 +15,7 @@ import {
 	presenceNamed,
 	REPO,
 	report,
+	type Run,
 	rpc,
 	sessionEntries,
 	sleep,
@@ -320,4 +321,128 @@ export const lineage = async (): Promise<boolean> => {
 	return report("lineage: rpc parent, pi -p children started with its PI_SESSION_ID; ended, died, /msg", checks);
 };
 
-export const SCENARIOS = { rpcWake, headlessPair, steerBusy, webHost, lineage } as const;
+const diedTo = (w: World, box: string): Message[] => messagesIn(w, box).filter((message) => message.kind === "died");
+
+const sameLife = (message: Message | undefined, record: Presence): boolean =>
+	message?.life?.pid === record.pid && message.life.startedAt === record.startedAt;
+
+const deliveredDied = (w: World, id: string): boolean => customMessages(sessionEntries(w, id)).some((entry) => (entry.details as Message | undefined)?.kind === "died");
+
+/**
+ * Children that don't last: one SIGKILLed about a second after its msg starts gets exactly one `died`,
+ * within a tick or two (the parent finds new children every tick and judges ones it never saw live);
+ * one SIGTERMed as soon ends cleanly: `ended`, never `died`.
+ */
+export const quickDeath = async (): Promise<boolean> => {
+	const w = world("quick");
+	const checks: Check[] = [];
+	try {
+		const boss = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc"]));
+		const bossRecord = await waitUntil("boss online", () => presenceNamed(w, "boss"), ONLINE_TIMEOUT_MS);
+		const asChild = { PI_SESSION_ID: bossRecord.id };
+		const crasher = spawnPi(w, piArgs(w, "crasher", ["-p", SLEEPER_TASK]), REPO, asChild);
+		const crasherRecord = await waitUntil("crasher online", () => presenceNamed(w, "crasher"), ONLINE_TIMEOUT_MS, 50);
+		await sleep(1_000);
+		crasher.proc.kill("SIGKILL");
+		const killedAt = Date.now();
+		const quitter = spawnPi(w, piArgs(w, "quitter", ["-p", SLEEPER_TASK]), REPO, asChild);
+		const quitterRecord = await waitUntil("quitter online", () => presenceNamed(w, "quitter"), ONLINE_TIMEOUT_MS, 50);
+		await sleep(1_000);
+		quitter.proc.kill("SIGTERM");
+		const [crasherDone, quitterDone] = await Promise.all([crasher.done, quitter.done]);
+		const died = await waitUntil("boss records the crasher's died", () => diedTo(w, bossRecord.id)[0], 20_000).catch(() => undefined);
+		const delivered = await waitUntil("the died reaches boss's conversation", () => (deliveredDied(w, bossRecord.id) ? true : undefined), 30_000).catch(() => false);
+		await sleep(12_000);
+		boss.proc.stdin.end();
+		const bossDone = await boss.done;
+
+		const toBoss = messagesIn(w, bossRecord.id);
+		const deaths = diedTo(w, bossRecord.id);
+		const quitterEnded = toBoss.filter((message) => message.kind === "ended" && message.from.id === quitterRecord.id);
+		checks.push(
+			check("both children name boss as their parent", crasherRecord.parent === bossRecord.id && quitterRecord.parent === bossRecord.id),
+			check("SIGKILL left the crasher's record without endedAt", readPresence(w.store, crasherRecord.id)?.endedAt === undefined && crasherDone.code !== 0),
+			check("exactly one died, from the crasher", deaths.length === 1 && deaths[0]?.from.id === crasherRecord.id, JSON.stringify(deaths.map((message) => [message.from.name, message.text]))),
+			check("it names the crasher's life", sameLife(died, crasherRecord), JSON.stringify([died?.life, crasherRecord.pid, crasherRecord.startedAt])),
+			check("it came within a few seconds of the kill", died !== undefined && died.ts - killedAt < 5_000, `${died ? died.ts - killedAt : "?"}ms after the kill`),
+			check("boss got it delivered", delivered === true),
+			check(
+				"the SIGTERMed quitter ended: one ended, no died",
+				quitterEnded.length === 1 && readPresence(w.store, quitterRecord.id)?.endedAt !== undefined && !deaths.some((message) => message.from.id === quitterRecord.id),
+				`exit ${quitterDone.code}, ${JSON.stringify(quitterEnded)}`,
+			),
+			check("no extension errors", !/\[msg\]|extension.*error/i.test(bossDone.stderr + crasherDone.stderr + quitterDone.stderr), clip(bossDone.stderr + quitterDone.stderr)),
+		);
+	} catch (error) {
+		checks.push(check("scenario ran", false, String(error)));
+	} finally {
+		w.dispose();
+	}
+	return report("quick death: a child SIGKILLed a second in gets one died; one SIGTERMed ends", checks);
+};
+
+/** A child SIGKILLed while its parent is stopped: the parent reports it when it resumes, and a second resume adds nothing. */
+export const offlineDeath = async (): Promise<boolean> => {
+	const w = world("offline");
+	const checks: Check[] = [];
+	try {
+		const first = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc"]));
+		const bossRecord = await waitUntil("boss online", () => presenceNamed(w, "boss"), ONLINE_TIMEOUT_MS);
+		await sleep(STARTUP_GRACE_MS);
+		rpc(first, { id: "hello", type: "prompt", message: "Reply with just OK." });
+		const answered = () => sessionEntries(w, bossRecord.id).some((entry) => (entry.message as { role?: string } | undefined)?.role === "assistant");
+		await waitUntil("boss has a session file to resume", () => (answered() ? true : undefined), 120_000);
+		const kid = spawnPi(w, piArgs(w, "kid", ["-p", SLEEPER_TASK]), REPO, { PI_SESSION_ID: bossRecord.id });
+		const kidRecord = await waitUntil("kid busy", () => {
+			const found = presenceNamed(w, "kid");
+			return found?.activity === "busy" ? found : undefined;
+		}, ONLINE_TIMEOUT_MS);
+		first.proc.stdin.end();
+		const firstDone = await first.done;
+		const bossStopped = readPresence(w.store, bossRecord.id)?.endedAt !== undefined;
+		kid.proc.kill("SIGKILL");
+		await kid.done;
+		await sleep(2_000);
+		const whileStopped = diedTo(w, bossRecord.id).length;
+
+		const resume = async (label: string): Promise<{ run: Run; record: Presence }> => {
+			const previous = readPresence(w.store, bossRecord.id)?.startedAt ?? 0;
+			const run = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc", "--session", bossRecord.id]));
+			const record = await waitUntil(label, () => {
+				const found = readPresence(w.store, bossRecord.id);
+				return found && found.endedAt === undefined && found.startedAt > previous ? found : undefined;
+			}, ONLINE_TIMEOUT_MS);
+			return { run, record };
+		};
+		const second = await resume("boss resumed");
+		const died = await waitUntil("the resumed boss records the kid's died", () => diedTo(w, bossRecord.id)[0], 15_000).catch(() => undefined);
+		const delivered = await waitUntil("the died reaches boss's conversation", () => (deliveredDied(w, bossRecord.id) ? true : undefined), 30_000).catch(() => false);
+		await waitUntil("boss idle again", () => (readPresence(w.store, bossRecord.id)?.activity === "idle" ? true : undefined), 120_000).catch(() => undefined);
+		second.run.proc.stdin.end();
+		const secondDone = await second.run.done;
+		const third = await resume("boss resumed again");
+		await sleep(12_000);
+		third.run.proc.stdin.end();
+		const thirdDone = await third.run.done;
+
+		const deaths = diedTo(w, bossRecord.id);
+		const stderr = firstDone.stderr + secondDone.stderr + thirdDone.stderr;
+		checks.push(
+			check("the kid names boss as its parent", kidRecord.parent === bossRecord.id),
+			check("boss's record ended when it stopped", bossStopped),
+			check("nothing was reported while boss was stopped", whileStopped === 0),
+			check("the resumed boss reported the kid's death", died?.from.id === kidRecord.id && died.ts >= second.record.startedAt, JSON.stringify(died)),
+			check("it names the kid's life", sameLife(died, kidRecord), JSON.stringify([died?.life, kidRecord.pid, kidRecord.startedAt])),
+			check("it was delivered into boss's conversation", delivered === true),
+			check("a second resume adds nothing: exactly one died", deaths.length === 1, JSON.stringify(deaths.map((message) => [message.id, message.ts]))),
+			check("no extension errors", !/\[msg\]|extension.*error/i.test(stderr), clip(stderr)),
+		);
+	} catch (error) {
+		checks.push(check("scenario ran", false, String(error)));
+	} finally {
+		w.dispose();
+	}
+	return report("offline death: a child SIGKILLed while its parent is stopped is reported on resume, once", checks);
+};
+
+export const SCENARIOS = { rpcWake, headlessPair, steerBusy, webHost, lineage, quickDeath, offlineDeath } as const;
