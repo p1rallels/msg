@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { newMessageId, timeOfMessageId } from "../src/core/ids.ts";
-import { parseMsgCommand } from "../src/core/command.ts";
+import { parseMsgCommand, recipientCompletions } from "../src/core/command.ts";
 import { createMessage, MAX_TEXT_BYTES, parseMessage, renderForAgent, summarize } from "../src/core/message.ts";
 import { agentDir, isValidId, mailboxDirs, msgRoot } from "../src/core/paths.ts";
-import { fixedRandom, message } from "./helpers.ts";
+import { fixedRandom, message, presence } from "./helpers.ts";
 
 describe("paths", () => {
 	test("msg root: PI_MSG_DIR wins, then PI_CODING_AGENT_DIR, then ~/.pi/agent", () => {
@@ -170,5 +170,31 @@ describe("parseMsgCommand", () => {
 		expect(parseMsgCommand("builder   ")).toBeUndefined();
 		expect(parseMsgCommand('"/open quote hi')).toBeUndefined();
 		expect(parseMsgCommand('"" hi')).toBeUndefined();
+	});
+});
+
+describe("recipientCompletions", () => {
+	const live = [
+		presence({ id: "x-1", name: "stranger" }),
+		presence({ id: "k-1", name: "kid", parent: "me" }),
+		presence({ id: "p-1", name: "tandem boss" }),
+		presence({ id: "u-1" }),
+		presence({ id: "me", name: "me" }),
+	];
+	const values = (prefix: string, self: { id: string; parent?: string } = { id: "me", parent: "p-1" }) =>
+		recipientCompletions(prefix, live, self)?.map((item) => item.value) ?? null;
+
+	test("parent, children, then family before strangers; never me; spaced names quoted", () => {
+		expect(values("")).toEqual(["parent", "children", '"tandem boss"', "kid", "stranger", "u-1"]);
+		expect(values("", { id: "nobody" })).toEqual(["stranger", "kid", '"tandem boss"', "u-1", "me"]);
+	});
+
+	test("filters by prefix on the name or the address; stops once the text starts", () => {
+		expect(values("k")).toEqual(["kid"]);
+		expect(values("ta")).toEqual(['"tandem boss"']);
+		expect(values('"tan')).toEqual(['"tandem boss"']);
+		expect(values("pa")).toEqual(["parent"]);
+		expect(values("zzz")).toBeNull();
+		expect(values("kid hello")).toBeNull();
 	});
 });

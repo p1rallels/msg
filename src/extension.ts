@@ -4,7 +4,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { MSG_COMMAND_USAGE, parseMsgCommand } from "./core/command.ts";
+import { MSG_COMMAND_USAGE, parseMsgCommand, recipientCompletions } from "./core/command.ts";
 import { expectation, formatDirectory, targetLabel } from "./core/format.ts";
 import { sweepOrphans } from "./core/housekeeping.ts";
 import { assistantWords, childrenOf, diedText, endedText, inheritedParent, lastWordsIn, relationOf, watchChildren } from "./core/lineage.ts";
@@ -472,6 +472,10 @@ export default function msgExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("msg", {
 		description: "Message another session as its user: /msg <to> <text> (to: parent, children, a folder, a name or an id)",
+		getArgumentCompletions: (prefix) => {
+			const current = live;
+			return current ? recipientCompletions(prefix, directory(listSafely(), Date.now()).live, current.presence) : null;
+		},
 		handler: async (args, ctx) => {
 			const say = (text: string, level: "info" | "warning" | "error"): void => {
 				if (ctx.hasUI) ctx.ui.notify(text, level);
