@@ -41,11 +41,11 @@ started this process.
   lists the whole machine; a session with no family sees everyone
 - **exits are messages**: when a child ends (pi exits or quits, or its host switches session or
   disposes of it) it sends its parent a `kind: "ended"` message whose text is its last assistant message
-  (cut near 600 chars, with a pointer to the rest). When a child the parent saw live goes offline
-  without ending (its pid is gone, or no heartbeat for 45s of time the parent was awake too), the
-  parent's own msg drops a `kind: "died"` message from that child into the parent's inbox, once per
-  life. Both are delivered like any message: a waiting `msg_wait` takes them, a busy parent gets them
-  steered in, an idle one wakes up
+  (cut near 600 chars, with a pointer to the rest). When a child goes offline without ending (its pid
+  is gone, or no heartbeat for 45s of time the parent was awake too), the parent's own msg drops a
+  `kind: "died"` message from that child into the parent's inbox, once per life, even if the parent
+  never saw it live or wasn't running when it died. Both are delivered like any message: a waiting
+  `msg_wait` takes them, a busy parent gets them steered in, an idle one wakes up
 - **words, not walls**: anyone can still message anyone. The tool guidelines (they ship in every
   session's prompt) say: if you have a parent, talk only to it (siblings coordinate through it), ask
   with `wait_seconds` when you're blocked, never acknowledge, and your final message is your report
@@ -175,10 +175,14 @@ Message ids are time-sortable (`0mv962x7b-67ef02`: base36 ms + random), so `ls n
 ## Caveats
 
 - **one machine.** The store is a local directory; there's no network transport
-- **`died` needs a running parent**: the parent's msg notices the death on its 2s tick (it looks for
-  new children every 10s, so a child that crashes within seconds of starting may go unreported).
-  A child that dies while its parent isn't running isn't reported later; `msg_list` shows it offline.
-  A child killed between posting `ended` and marking itself ended (microseconds) reports both
+- **when `died` comes**: a running parent's msg looks for new children on every 2s tick (one readdir
+  of `sessions/`, reading only new records), so a child that crashes a second after starting is
+  reported within a tick or two. A session resumed from the parent's bash reuses its old record file,
+  so the parent finds it on its 10s full scan instead. A child that dies while its parent isn't
+  running is reported when the parent next starts (resume, `pi --session`, a pi-web re-attach). The
+  parent's inbox is its memory of what it reported (a `died` names the child's pid and start), and
+  delivered messages go after 7 days, so a death over 6 days old by then is never reported. A child
+  killed between posting `ended` and marking itself ended (microseconds) reports both
 - **pi-web evicts idle sessions** nobody is viewing after 15 minutes. Their mail waits until the
   session is opened again; nothing reopens it automatically yet. A session blocked in `msg_wait` is
   busy, not idle, so an orchestrator waiting on its children stays
