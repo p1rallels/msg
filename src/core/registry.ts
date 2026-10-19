@@ -2,7 +2,7 @@ import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { listJsonFiles, parseJson, readTextOrUndefined, writeFileAtomic } from "./fsx.ts";
 import { normalizeName } from "./message.ts";
-import { isValidId, presencePath, sessionsDir } from "./paths.ts";
+import { isValidId, presencePath, recordFile, sessionsDir } from "./paths.ts";
 import { fail, ok, type Result } from "./result.ts";
 
 export const PRESENCE_VERSION = 1;
@@ -70,21 +70,29 @@ export const parsePresence = (value: unknown): Result<Presence> => {
 export const writePresence = (root: string, presence: Presence): void =>
 	writeFileAtomic(presencePath(root, presence.id), `${JSON.stringify(presence)}\n`);
 
-export const readPresence = (root: string, id: string): Presence | undefined => {
-	if (!isValidId(id)) return undefined;
-	const raw = readTextOrUndefined(presencePath(root, id));
+const readRecordFile = (root: string, file: string): Presence | undefined => {
+	const raw = readTextOrUndefined(join(sessionsDir(root), file));
 	if (raw === undefined) return undefined;
 	const parsed = parsePresence(parseJson(raw));
 	return parsed.ok ? parsed.value : undefined;
 };
 
-export const listPresence = (root: string): Presence[] =>
-	listJsonFiles(sessionsDir(root)).flatMap((file) => {
-		const raw = readTextOrUndefined(join(sessionsDir(root), file));
-		if (raw === undefined) return [];
-		const parsed = parsePresence(parseJson(raw));
-		return parsed.ok ? [parsed.value] : [];
-	});
+export const readPresence = (root: string, id: string): Presence | undefined => (isValidId(id) ? readRecordFile(root, recordFile(id)) : undefined);
+
+export interface Sessions {
+	/** Every record file in `sessions/`, read or not. */
+	readonly files: ReadonlySet<string>;
+	/** The records of the files that were read. A file that vanished or doesn't parse has none. */
+	readonly records: readonly Presence[];
+}
+
+/** One readdir of `sessions/`, reading only the record files `wanted` picks. */
+export const readSessions = (root: string, wanted: (file: string) => boolean): Sessions => {
+	const files = listJsonFiles(sessionsDir(root));
+	return { files: new Set(files), records: files.filter(wanted).flatMap((file) => readRecordFile(root, file) ?? []) };
+};
+
+export const listPresence = (root: string): Presence[] => [...readSessions(root, () => true).records];
 
 export type PidProbe = (pid: number) => boolean;
 

@@ -6,18 +6,19 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { MSG_COMMAND_USAGE, parseMsgCommand, recipientCompletions } from "./core/command.ts";
 import { expectation, formatDirectory, targetLabel } from "./core/format.ts";
-import { sweepOrphans } from "./core/housekeeping.ts";
-import { assistantWords, childrenOf, diedText, endedText, inheritedParent, lastWordsIn, relationOf, watchChildren } from "./core/lineage.ts";
+import { DELIVERED_TTL_MS, OFFLINE_TTL_MS, sweepOrphans } from "./core/housekeeping.ts";
+import { assistantWords, endedText, inheritedParent, lastWordsIn, relationOf } from "./core/lineage.ts";
 import { ensureMailbox, pruneDelivered } from "./core/maildir.ts";
-import { type Delivery, type Message, normalizeName, partyLabel, type Relation, renderForAgent, type Sender } from "./core/message.ts";
+import { type Delivery, type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
 import { isValidId, mailboxDirs, msgRoot } from "./core/paths.ts";
 import { DEFAULT_WAKE_BUDGET, deliveryAction, recentWakes, type SessionState, wakeAllowed } from "./core/policy.ts";
 import { pumpOnce } from "./core/pump.ts";
 import { directory, HEARTBEAT_EVERY_MS, listPresence, type Mode, type Presence, pruneOffline, readPresence, writePresence } from "./core/registry.ts";
 import { isChildren, type Target } from "./core/resolve.ts";
 import { fail, ok, type Result } from "./core/result.ts";
-import { canAnswer, findRecipient, liveChildren, type Outgoing, post, postExit } from "./core/send.ts";
+import { canAnswer, findRecipient, liveChildren, type Outgoing, post, postExit, senderOf } from "./core/send.ts";
 import { createWaiters, isFrom, isFromChildOf, isReplyTo, type MessageMatch, type Waiters, type WaitOutcome } from "./core/waiters.ts";
+import { type ChildWatch, lookAfterChildren, newWatch, type Scope } from "./core/watch.ts";
 
 const CUSTOM_TYPE = "msg";
 const STATUS_KEY = "msg";
@@ -27,8 +28,6 @@ const SCAN_EVERY_MS = HEARTBEAT_EVERY_MS;
 const WAKE_GAP_MS = 10_000;
 const PUMP_DEBOUNCE_MS = 25;
 const STARTUP_GRACE_MS = 3_000;
-const DELIVERED_TTL_MS = 7 * 24 * 60 * 60_000;
-const OFFLINE_TTL_MS = 30 * 24 * 60 * 60_000;
 const DEFAULT_WAIT_SECONDS = 300;
 const MAX_WAIT_SECONDS = 3_600;
 const MAX_OFFLINE_LISTED = 15;
@@ -48,8 +47,8 @@ interface Live {
 	/** Messages whose sender is blocked waiting for our reply: id -> who and until when. */
 	awaited: Map<string, { readonly from: string; readonly until: number }>;
 	status: string | undefined;
-	/** Children seen live and still owed a `died` notice should they vanish. */
-	seen: ReadonlySet<string>;
+	/** The children this session looks after, and the deaths it already reported. */
+	watch: ChildWatch;
 	lastScanAt: number;
 	lastTickAt: number;
 	/** Since when this process has been running without a suspension gap. */
@@ -84,8 +83,6 @@ const clipLines = (text: string, max: number): string => {
 };
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
-
-const senderOf = (presence: Presence): Sender => ({ id: presence.id, ...(presence.name ? { name: presence.name } : {}), cwd: presence.cwd });
 
 const describeReply = (outcome: WaitOutcome, who: string, seconds: number): string => {
 	switch (outcome.kind) {
@@ -286,32 +283,30 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Looks in on the children: every record on a scan (finds new ones), else just the ones seen live.
-	 * A child that vanished without ending gets a `died` notice in our own inbox, delivered like any message.
+	 * Looks after the children: every record on a full look, else only new and outdated ones. A child
+	 * that went offline without ending gets a `died` notice in our own inbox, delivered like any message.
+	 * Returns the records read.
 	 */
-	const watchFamily = (current: Live, now: number, records: readonly Presence[] | undefined): void => {
-		const known = records ?? [...current.seen].flatMap((id) => readSafely(id) ?? []);
-		const watched = watchChildren(childrenOf(known, current.id), current.seen, now, current.awakeSince);
-		current.seen = watched.seen;
-		for (const death of watched.died) {
-			try {
-				const posted = postExit(root, senderOf(death.child), current.id, "died", diedText(death, now), now);
-				if (!posted.ok) console.error(`[msg] could not record that ${partyLabel(death.child)} died: ${posted.error}`);
-			} catch (error) {
-				console.error(`[msg] could not record that ${partyLabel(death.child)} died: ${errorText(error)}`);
-			}
+	const watchFamily = (current: Live, now: number, scope: Scope): readonly Presence[] => {
+		try {
+			const look = lookAfterChildren(root, current.id, current.watch, scope, now, current.awakeSince);
+			current.watch = look.watch;
+			for (const { death, error } of look.failed) console.error(`[msg] could not record that ${partyLabel(death.child)} died: ${error}`);
+			return look.records;
+		} catch {
+			return [];
 		}
 	};
 
-	const scan = (current: Live, now: number): void => {
+	const scan = (current: Live, now: number): readonly Presence[] => {
 		current.lastScanAt = now;
-		const records = listSafely();
-		watchFamily(current, now, records);
+		const records = watchFamily(current, now, "full");
 		try {
 			updateStatus(current, records, now);
 		} catch {
 			// a status line is cosmetic
 		}
+		return records;
 	};
 
 	const tick = (current: Live): void => {
@@ -335,7 +330,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			savePresence(current, { ...withName(presence, name), activity, heartbeatAt: now });
 		}
 		if (now - current.lastScanAt >= SCAN_EVERY_MS) scan(current, now);
-		else watchFamily(current, now, undefined);
+		else watchFamily(current, now, "quick");
 		pump(current);
 	};
 
@@ -400,7 +395,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			pumpQueued: false,
 			awaited: new Map(),
 			status: undefined,
-			seen: new Set(),
+			watch: newWatch(),
 			lastScanAt: 0,
 			lastTickAt: now,
 			awakeSince: now,
@@ -521,9 +516,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 				tick(current);
 			}
 			const now = Date.now();
-			const records = listSafely();
-			watchFamily(current, now, records);
-			const dir = directory(records, now);
+			const dir = directory(scan(current, now), now);
 			const text = formatDirectory(dir, current.presence, now, home, { all: params.all === true, maxOffline: MAX_OFFLINE_LISTED });
 			return { content: toolText(text), details: { live: dir.live.length, offline: dir.offline.length } };
 		},

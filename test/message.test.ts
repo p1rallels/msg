@@ -84,6 +84,17 @@ describe("parseMessage", () => {
 		expect(["kind" in plain, "byUser" in plain]).toEqual([false, false]);
 	});
 
+	test("a died notice's life round-trips; a malformed one is dropped", () => {
+		const died = message({ to: "b-1", kind: "died", life: { pid: 7, startedAt: 1_234 } });
+		expect(died.life).toEqual({ pid: 7, startedAt: 1_234 });
+		expect(parseMessage(JSON.parse(JSON.stringify(died)))).toEqual({ ok: true, value: died });
+		for (const life of [{ pid: "7", startedAt: 1 }, { pid: 7 }, 42, null]) {
+			const parsed = parseMessage({ ...died, life });
+			expect(parsed.ok && "life" in parsed.value).toBe(false);
+		}
+		expect("life" in message({ to: "b-1" })).toBe(false);
+	});
+
 	test("falls back to steer on an unknown delivery", () => {
 		const parsed = parseMessage({ ...message({ to: "b-1" }), delivery: "teleport" });
 		expect(parsed.ok && parsed.value.delivery).toBe("steer");

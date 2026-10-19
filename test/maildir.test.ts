@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { allMessages, claim, deliver, ensureMailbox, peek, pending, pruneDelivered, unclaim } from "../src/core/maildir.ts";
+import { allMessages, claim, deliver, ensureMailbox, messagesSince, peek, pending, pruneDelivered, unclaim } from "../src/core/maildir.ts";
 import { message, tempRoot } from "./helpers.ts";
 
 let root = "";
@@ -99,6 +99,27 @@ describe("allMessages", () => {
 		const stored = allMessages(root);
 		expect(stored.map((entry) => entry.message.text)).toEqual(["1", "2", "3"]);
 		expect(stored.map((entry) => entry.state)).toEqual(["delivered", "pending", "pending"]);
+	});
+});
+
+describe("messagesSince", () => {
+	test("pending and delivered messages sent at or after a time; older files aren't read", () => {
+		const old = message({ to: "bob", text: "old" }, 1_000);
+		const edge = message({ to: "bob", text: "edge" }, 2_000);
+		const late = message({ to: "bob", text: "late" }, 3_000);
+		[old, edge, late].forEach((item) => deliver(root, item));
+		claim(root, "bob", `${late.id}.json`);
+		const dirs = ensureMailbox(root, "bob");
+		writeFileSync(join(dirs.new, `${message({ to: "bob" }, 500).id}.json`), "{not json");
+		expect(messagesSince(root, "bob", 2_000).map((item) => item.text)).toEqual(["edge", "late"]);
+		expect(messagesSince(root, "bob", 3_001)).toEqual([]);
+		expect(messagesSince(root, "nobody", 0)).toEqual([]);
+	});
+
+	test("a file whose name isn't a message id is read to be safe", () => {
+		const dirs = ensureMailbox(root, "bob");
+		writeFileSync(join(dirs.cur, "hand-written.json"), JSON.stringify(message({ to: "bob", text: "odd" }, 1)));
+		expect(messagesSince(root, "bob", 5_000).map((item) => item.text)).toEqual(["odd"]);
 	});
 });
 

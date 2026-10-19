@@ -45,7 +45,10 @@ export const canonicalPath = (path: string): string => {
 
 export const sessionsDir = (root: string): string => join(root, "sessions");
 
-export const presencePath = (root: string, id: string): string => join(sessionsDir(root), `${assertValidId(id)}.json`);
+/** The name of a session's presence record in `sessions/`. */
+export const recordFile = (id: string): string => `${assertValidId(id)}.json`;
+
+export const presencePath = (root: string, id: string): string => join(sessionsDir(root), recordFile(id));
 
 export interface MailboxDirs {
 	readonly tmp: string;

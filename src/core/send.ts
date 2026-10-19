@@ -1,9 +1,9 @@
 import { homedir } from "node:os";
 import { childrenOf } from "./lineage.ts";
 import { deliver } from "./maildir.ts";
-import { createMessage, type Delivery, type Kind, type Message, type Sender } from "./message.ts";
+import { createMessage, type Delivery, type Kind, type Life, type Message, type Sender } from "./message.ts";
 import { canonicalPath } from "./paths.ts";
-import { directory, listPresence, type PidProbe, pidAlive } from "./registry.ts";
+import { directory, listPresence, type PidProbe, pidAlive, type Presence } from "./registry.ts";
 import { type Asker, cleanQuery, folderOf, type Lookup, resolveTarget, type Target } from "./resolve.ts";
 import { fail, ok, type Result } from "./result.ts";
 
@@ -17,6 +17,9 @@ export interface Outgoing {
 }
 
 export const machineLookup = (): Lookup => ({ home: homedir(), canonical: canonicalPath });
+
+/** A session as the sender of a message: its id, name and folder. */
+export const senderOf = (presence: Presence): Sender => ({ id: presence.id, ...(presence.name ? { name: presence.name } : {}), cwd: presence.cwd });
 
 const isSelf = (query: string, self: Asker, lookup: Lookup): boolean => {
 	const cleaned = cleanQuery(query);
@@ -66,9 +69,12 @@ export const post = (root: string, from: Sender, target: Target, outgoing: Outgo
 	return ok(created.value);
 };
 
-/** Drops an exit notice: `ended` goes from a child to its parent, `died` into the parent's own inbox `from` the child. */
-export const postExit = (root: string, from: Sender, to: string, kind: Kind, text: string, now: number): Result<Message> => {
-	const created = createMessage({ from, to, text, kind }, now);
+/**
+ * Drops an exit notice: `ended` goes from a child to its parent, `died` into the parent's own inbox
+ * `from` the child, naming the `life` that died.
+ */
+export const postExit = (root: string, from: Sender, to: string, kind: Kind, text: string, now: number, life?: Life): Result<Message> => {
+	const created = createMessage({ from, to, text, kind, ...(life ? { life } : {}) }, now);
 	if (!created.ok) return created;
 	deliver(root, created.value);
 	return ok(created.value);

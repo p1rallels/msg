@@ -1,18 +1,23 @@
 import { describe, expect, test } from "bun:test";
+import { DELIVERED_TTL_MS } from "../src/core/housekeeping.ts";
 import {
 	assistantWords,
+	DEATH_WINDOW_MS,
 	diedText,
 	endedText,
 	familyOf,
 	hasFamily,
 	inheritedParent,
+	isNoticeOf,
 	LAST_WORDS_MAX,
 	lastWordsIn,
+	lifeOf,
 	relationOf,
 	watchChildren,
 } from "../src/core/lineage.ts";
-import { STALE_AFTER_MS } from "../src/core/registry.ts";
-import { presence } from "./helpers.ts";
+import type { Life } from "../src/core/message.ts";
+import { type Presence, STALE_AFTER_MS } from "../src/core/registry.ts";
+import { message, presence } from "./helpers.ts";
 
 const PARENT = "01a152a0-f00d-72aa-a896-d904c458282b";
 const SELF = "01a152d4-d2c3-751d-ab2f-1d14f1974871";
@@ -71,62 +76,97 @@ describe("family", () => {
 });
 
 describe("watchChildren", () => {
-	const now = 1_000_000;
+	const now = 30 * 24 * 3_600_000;
 	const alive = () => true;
 	const pids = (...dead: number[]) => (pid: number) => !dead.includes(pid);
 	const child = (id: string, overrides: Partial<Parameters<typeof presence>[0]> = {}) =>
 		presence({ id, parent: "me", pid: 100, heartbeatAt: now, startedAt: now - 60_000, ...overrides });
+	const notice = (kid: Presence, ts: number, life: Life | undefined = lifeOf(kid)) =>
+		message({ to: "me", from: { id: kid.id }, kind: "died", text: "gone", ...(life ? { life } : {}) }, ts);
+	const deaths = (watched: ReturnType<typeof watchChildren>) => watched.died.map((death) => [death.child.id, death.cause]);
+	const ids = (records: readonly Presence[]) => records.map((record) => record.id);
 
-	test("live children join the watch", () => {
-		const watched = watchChildren([child("a"), child("b")], new Set(), now, 0, alive);
-		expect([...watched.seen].sort()).toEqual(["a", "b"]);
+	test("live children are watched; nobody died", () => {
+		const watched = watchChildren([child("a"), child("b")], [], now, 0, alive);
+		expect(ids(watched.watched)).toEqual(["a", "b"]);
 		expect(watched.died).toEqual([]);
 	});
 
-	test("a watched child whose process is gone without ending died, once", () => {
+	test("a child whose process is gone without ending died, whether or not it was ever seen live", () => {
+		const crashed = child("a", { pid: 7, startedAt: now - 1_500, heartbeatAt: now - 1_500 });
+		const watched = watchChildren([crashed, child("b")], [], now, 0, pids(7));
+		expect(deaths(watched)).toEqual([["a", "exited"]]);
+		expect(ids(watched.watched)).toEqual(["b"]);
+	});
+
+	test("once its notice exists the death is settled: not reported, not watched", () => {
 		const gone = child("a", { pid: 7, heartbeatAt: now - 3_000 });
-		const first = watchChildren([gone], new Set(["a"]), now, 0, pids(7));
-		expect(first.died.map((death) => [death.child.id, death.cause])).toEqual([["a", "exited"]]);
-		expect(first.seen.has("a")).toBe(false);
-		const again = watchChildren([gone], first.seen, now + 2_000, 0, pids(7));
+		const again = watchChildren([gone], [notice(gone, now - 1_000)], now + 2_000, 0, pids(7));
 		expect(again.died).toEqual([]);
+		expect(again.watched).toEqual([]);
 	});
 
 	test("a child that ended cleanly never dies, even after its process exits", () => {
 		const ended = child("a", { pid: 7, endedAt: now - 1_000 });
-		const watched = watchChildren([ended], new Set(["a"]), now, 0, pids(7));
+		const watched = watchChildren([ended], [], now, 0, pids(7));
 		expect(watched.died).toEqual([]);
-		expect(watched.seen.size).toBe(0);
+		expect(watched.watched).toEqual([]);
 	});
 
-	test("a child never seen live is never reported", () => {
-		const old = child("a", { pid: 7, heartbeatAt: now - 3_600_000 });
-		expect(watchChildren([old], new Set(), now, 0, pids(7)).died).toEqual([]);
-		expect(watchChildren([old], new Set(), now, 0, alive).seen.size).toBe(0);
+	test("deaths older than the window are let be, since their notice may already be pruned", () => {
+		const old = child("a", { pid: 7, heartbeatAt: now - DEATH_WINDOW_MS });
+		expect(watchChildren([old], [], now, 0, pids(7)).died).toEqual([]);
+		const lastDay = child("a", { pid: 7, heartbeatAt: now - DEATH_WINDOW_MS + 1 });
+		expect(deaths(watchChildren([lastDay], [], now, 0, pids(7)))).toEqual([["a", "exited"]]);
+		expect(DELIVERED_TTL_MS - DEATH_WINDOW_MS).toBeGreaterThanOrEqual(60 * 60_000);
 	});
 
 	test("silent: a live pid that stopped heartbeating dies only after the stale window of our own waking time", () => {
 		const quiet = child("a", { heartbeatAt: now - STALE_AFTER_MS - 1 });
-		expect(watchChildren([quiet], new Set(["a"]), now, 0, alive).died.map((death) => death.cause)).toEqual(["silent"]);
-		const justWoke = watchChildren([quiet], new Set(["a"]), now, now - 5_000, alive);
+		expect(deaths(watchChildren([quiet], [], now, 0, alive))).toEqual([["a", "silent"]]);
+		const justWoke = watchChildren([quiet], [], now, now - 5_000, alive);
 		expect(justWoke.died).toEqual([]);
-		expect(justWoke.seen.has("a")).toBe(true);
-		const later = watchChildren([quiet], justWoke.seen, now - 5_000 + STALE_AFTER_MS + 1, now - 5_000, alive);
-		expect(later.died.map((death) => death.cause)).toEqual(["silent"]);
+		expect(ids(justWoke.watched)).toEqual(["a"]);
+		const later = watchChildren([quiet], [], now - 5_000 + STALE_AFTER_MS + 1, now - 5_000, alive);
+		expect(deaths(later)).toEqual([["a", "silent"]]);
 	});
 
-	test("children that vanish from the registry leave the watch quietly", () => {
-		const watched = watchChildren([], new Set(["a"]), now, 0, alive);
-		expect(watched.seen.size).toBe(0);
-		expect(watched.died).toEqual([]);
+	test("a parent just started gives a days-silent child with a running pid the same grace", () => {
+		const quiet = child("a", { heartbeatAt: now - 2 * 24 * 3_600_000 });
+		expect(ids(watchChildren([quiet], [], now, now, alive).watched)).toEqual(["a"]);
+		expect(deaths(watchChildren([quiet], [], now + STALE_AFTER_MS + 1, now, alive))).toEqual([["a", "silent"]]);
 	});
 
-	test("a resumed child is watched again, so its next death is reported too", () => {
-		const back = child("a", { pid: 8, startedAt: now });
-		const watched = watchChildren([back], new Set(), now, 0, alive);
-		expect(watched.seen.has("a")).toBe(true);
-		const dead = watchChildren([{ ...back, heartbeatAt: now }], watched.seen, now + 4_000, 0, pids(8));
-		expect(dead.died.length).toBe(1);
+	test("a child that beats again after a silent notice is live, and its next death is a new one", () => {
+		const quiet = child("a", { pid: 7, heartbeatAt: now - STALE_AFTER_MS - 1 });
+		const silentNotice = notice(quiet, now);
+		expect(watchChildren([quiet], [silentNotice], now + 2_000, 0, alive).died).toEqual([]);
+		const back = { ...quiet, heartbeatAt: now + 10_000 };
+		expect(ids(watchChildren([back], [silentNotice], now + 10_000, 0, alive).watched)).toEqual(["a"]);
+		expect(deaths(watchChildren([back], [silentNotice], now + 12_000, 0, pids(7)))).toEqual([["a", "exited"]]);
+	});
+
+	test("a resumed child is a new life: the last life's notice doesn't cover its death", () => {
+		const first = child("a", { pid: 7, startedAt: now - 60_000, heartbeatAt: now - 50_000 });
+		const firstNotice = notice(first, now - 48_000);
+		const resumed = child("a", { pid: 8, startedAt: now - 20_000, heartbeatAt: now - 20_000 });
+		expect(deaths(watchChildren([resumed], [firstNotice], now, 0, pids(7, 8)))).toEqual([["a", "exited"]]);
+	});
+
+	test("isNoticeOf: a died from that child, for that life, after its last heartbeat", () => {
+		const gone = child("a", { pid: 7, startedAt: now - 9_000, heartbeatAt: now - 3_000 });
+		expect(isNoticeOf(notice(gone, now - 3_000), gone)).toBe(true);
+		expect(isNoticeOf(notice(gone, now - 3_001), gone)).toBe(false);
+		expect(isNoticeOf(notice(gone, now, { pid: 7, startedAt: now - 99_000 }), gone)).toBe(false);
+		expect(isNoticeOf(notice(gone, now, { pid: 6, startedAt: now - 9_000 }), gone)).toBe(false);
+		expect(isNoticeOf(notice({ ...gone, id: "b" }, now), gone)).toBe(false);
+		expect(isNoticeOf(message({ to: "me", from: { id: "a" }, kind: "ended", life: lifeOf(gone) }, now), gone)).toBe(false);
+	});
+
+	test("isNoticeOf: a notice without a life, from an older msg, goes by the heartbeat alone", () => {
+		const gone = child("a", { pid: 7, heartbeatAt: now - 3_000 });
+		expect(isNoticeOf(notice(gone, now - 1_000, undefined), gone)).toBe(true);
+		expect(isNoticeOf(notice(gone, now - 5_000, undefined), gone)).toBe(false);
 	});
 
 	test("diedText says what happened", () => {

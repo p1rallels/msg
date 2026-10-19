@@ -1,9 +1,18 @@
-import { ago, partyLabel, type Relation } from "./message.ts";
+import { DELIVERED_TTL_MS } from "./housekeeping.ts";
+import { ago, type Life, type Message, partyLabel, type Relation } from "./message.ts";
 import { type Env, isValidId } from "./paths.ts";
-import { isLive, type Mode, type PidProbe, pidAlive, type Presence, STALE_AFTER_MS } from "./registry.ts";
+import { type Mode, type PidProbe, pidAlive, type Presence, STALE_AFTER_MS } from "./registry.ts";
 
 /** Last words longer than this are cut: the parent reads the gist, the session file keeps the rest. */
 export const LAST_WORDS_MAX = 600;
+
+/**
+ * A death is judged only while the child's last heartbeat is younger than this. Its `died` notice is
+ * written after that heartbeat and housekeeping keeps delivered messages DELIVERED_TTL_MS, so the
+ * notice that marks a death reported outlives every death still judged (the day of margin covers
+ * coarse file times and clock steps). An older death goes unreported rather than reported again.
+ */
+export const DEATH_WINDOW_MS = DELIVERED_TTL_MS - 24 * 60 * 60_000;
 
 /**
  * The session whose bash started this process: pi puts PI_SESSION_ID into every bash child's env and
@@ -45,38 +54,54 @@ export interface Death {
 	readonly cause: DeathCause;
 }
 
+export const lifeOf = (presence: Pick<Presence, "pid" | "startedAt">): Life => ({ pid: presence.pid, startedAt: presence.startedAt });
+
+/**
+ * True when `message` reports the death `child`'s record shows: a `died` from that child, about that
+ * life, sent after its last heartbeat (a child that beats again after a `silent` notice can die again).
+ * A notice without a life, from before notices named one, goes by the heartbeat alone.
+ */
+export const isNoticeOf = (message: Message, child: Presence): boolean =>
+	message.kind === "died" &&
+	message.from.id === child.id &&
+	message.ts >= child.heartbeatAt &&
+	(message.life === undefined || (message.life.pid === child.pid && message.life.startedAt === child.startedAt));
+
 export interface Watch {
-	/** Children seen live that haven't ended or been reported dead: the ones still owed a notice. */
-	readonly seen: ReadonlySet<string>;
+	/** Children that may still die: live ones, and silent ones still inside their grace. */
+	readonly watched: readonly Presence[];
 	readonly died: readonly Death[];
 }
 
-type Verdict = "live" | "ignore" | "unsure" | DeathCause;
+type Verdict = "watch" | "settled" | DeathCause;
 
-const verdict = (child: Presence, wasSeen: boolean, now: number, awakeSince: number, probe: PidProbe, staleAfterMs: number): Verdict => {
-	if (isLive(child, now, probe, staleAfterMs)) return "live";
-	if (!wasSeen || child.endedAt !== undefined) return "ignore";
-	if (!probe(child.pid)) return "exited";
-	return now - Math.max(child.heartbeatAt, awakeSince) > staleAfterMs ? "silent" : "unsure";
+const verdict = (child: Presence, notices: readonly Message[], now: number, awakeSince: number, probe: PidProbe, staleAfterMs: number): Verdict => {
+	if (child.endedAt !== undefined) return "settled";
+	const running = probe(child.pid);
+	if (running && now - child.heartbeatAt <= staleAfterMs) return "watch";
+	if (now - child.heartbeatAt >= DEATH_WINDOW_MS || notices.some((notice) => isNoticeOf(notice, child))) return "settled";
+	if (!running) return "exited";
+	return now - Math.max(child.heartbeatAt, awakeSince) > staleAfterMs ? "silent" : "watch";
 };
 
 /**
- * One look at your children. A child seen live that's now offline without having ended died: its
- * process is gone (`exited`), or it hasn't heartbeat for `staleAfterMs` of time you were awake too
- * (`silent`: after the machine sleeps every heartbeat is stale until the children beat again, so
- * `awakeSince` restarts the clock). A reported child leaves `seen`, so each life is reported once.
+ * One look at your children. A child offline without having ended died, whether or not you saw it
+ * live: its process is gone (`exited`), or it hasn't heartbeat for `staleAfterMs` of time you were
+ * awake too (`silent`: after a sleep, or when you start, every heartbeat is stale until the children
+ * beat again, so `awakeSince` restarts the clock). A death with a notice in `notices` was reported;
+ * one older than DEATH_WINDOW_MS is let be.
  */
 export const watchChildren = (
 	children: readonly Presence[],
-	seen: ReadonlySet<string>,
+	notices: readonly Message[],
 	now: number,
 	awakeSince: number,
 	probe: PidProbe = pidAlive,
 	staleAfterMs = STALE_AFTER_MS,
 ): Watch => {
-	const judged = children.map((child) => ({ child, verdict: verdict(child, seen.has(child.id), now, awakeSince, probe, staleAfterMs) }));
+	const judged = children.map((child) => ({ child, verdict: verdict(child, notices, now, awakeSince, probe, staleAfterMs) }));
 	return {
-		seen: new Set(judged.filter((item) => item.verdict === "live" || item.verdict === "unsure").map((item) => item.child.id)),
+		watched: judged.flatMap(({ child, verdict: found }) => (found === "watch" ? [child] : [])),
 		died: judged.flatMap(({ child, verdict: cause }) => (cause === "exited" || cause === "silent" ? [{ child, cause }] : [])),
 	};
 };

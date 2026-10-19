@@ -17,6 +17,12 @@ export interface Sender {
 	readonly cwd?: string;
 }
 
+/** One run of a session: its process and when it started. A session resumed is a new life. */
+export interface Life {
+	readonly pid: number;
+	readonly startedAt: number;
+}
+
 export interface Message {
 	readonly v: typeof MESSAGE_VERSION;
 	readonly id: string;
@@ -31,6 +37,8 @@ export interface Message {
 	readonly kind?: Kind;
 	/** A human typed it (`/msg`, or the msg CLI outside pi), not an agent. */
 	readonly byUser?: true;
+	/** Which life of the sender a `died` notice is about, so a parent reports each death once. */
+	readonly life?: Life;
 }
 
 export interface Draft {
@@ -42,6 +50,7 @@ export interface Draft {
 	readonly awaitingUntil?: number;
 	readonly kind?: Kind;
 	readonly byUser?: boolean;
+	readonly life?: Life;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -55,6 +64,13 @@ const optionalNumber = (value: unknown): number | undefined =>
 const isDelivery = (value: unknown): value is Delivery => value === "steer" || value === "followUp";
 
 const isKind = (value: unknown): value is Kind => value === "ended" || value === "died";
+
+const parseLife = (value: unknown): Life | undefined => {
+	if (!isRecord(value)) return undefined;
+	const pid = optionalNumber(value.pid);
+	const startedAt = optionalNumber(value.startedAt);
+	return pid === undefined || startedAt === undefined ? undefined : { pid, startedAt };
+};
 
 export const textBytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
@@ -98,6 +114,7 @@ export const parseMessage = (value: unknown): Result<Message> => {
 	const delivery = isDelivery(value.delivery) ? value.delivery : "steer";
 	const replyTo = optionalString(value.replyTo);
 	const awaitingUntil = optionalNumber(value.awaitingUntil);
+	const life = parseLife(value.life);
 	return ok({
 		v: MESSAGE_VERSION,
 		id,
@@ -110,6 +127,7 @@ export const parseMessage = (value: unknown): Result<Message> => {
 		...(awaitingUntil !== undefined ? { awaitingUntil } : {}),
 		...(isKind(value.kind) ? { kind: value.kind } : {}),
 		...(value.byUser === true ? { byUser: true as const } : {}),
+		...(life ? { life } : {}),
 	});
 };
 
@@ -132,6 +150,7 @@ export const createMessage = (draft: Draft, now: number, random: RandomHex = ran
 		...(draft.awaitingUntil !== undefined ? { awaitingUntil: draft.awaitingUntil } : {}),
 		...(draft.kind ? { kind: draft.kind } : {}),
 		...(draft.byUser ? { byUser: true as const } : {}),
+		...(draft.life ? { life: { pid: draft.life.pid, startedAt: draft.life.startedAt } } : {}),
 	});
 };
 

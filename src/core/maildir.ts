@@ -1,6 +1,7 @@
 import { statSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDir, isMissing, listDirs, listJsonFiles, moveIfPresent, parseJson, readTextOrUndefined, writeFileAtomic } from "./fsx.ts";
+import { timeOfMessageId } from "./ids.ts";
 import { type Message, parseMessage } from "./message.ts";
 import { inboxesDir, type MailboxDirs, mailboxDirs } from "./paths.ts";
 import { fail, ok, type Result } from "./result.ts";
@@ -81,6 +82,24 @@ export const allMessages = (root: string): StoredMessage[] =>
 			return [...readBox(dirs.new, "pending"), ...readBox(dirs.cur, "delivered")];
 		})
 		.sort((a, b) => a.message.ts - b.message.ts || a.message.id.localeCompare(b.message.id));
+
+const sentAt = (file: string): number | undefined => timeOfMessageId(file.replace(/\.json$/, ""));
+
+/**
+ * The messages in `id`'s inbox, pending and delivered, sent at or after `since`. Names are
+ * time-sortable ids, so older files aren't read; a name that isn't one is read to be safe.
+ */
+export const messagesSince = (root: string, id: string, since: number): Message[] => {
+	const dirs = mailboxDirs(root, id);
+	return [dirs.new, dirs.cur].flatMap((dir) =>
+		listJsonFiles(dir)
+			.filter((file) => (sentAt(file) ?? since) >= since)
+			.flatMap((file) => {
+				const message = readMessage(join(dir, file));
+				return message.ok ? [message.value] : [];
+			}),
+	);
+};
 
 const isOlderThan = (path: string, cutoff: number): boolean => {
 	try {

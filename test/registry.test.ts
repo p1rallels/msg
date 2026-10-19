@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDir } from "../src/core/fsx.ts";
 import { sessionsDir } from "../src/core/paths.ts";
-import { directory, isLive, listPresence, parsePresence, pidAlive, pruneOffline, readPresence, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
+import { directory, isLive, listPresence, parsePresence, pidAlive, pruneOffline, readPresence, readSessions, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
 import { resolveTarget } from "../src/core/resolve.ts";
 import { presence, tempRoot } from "./helpers.ts";
 
@@ -35,6 +35,22 @@ describe("presence records", () => {
 		writeFileSync(join(sessionsDir(root), "broken.json"), "{");
 		writeFileSync(join(sessionsDir(root), "wrong.json"), JSON.stringify({ v: 9 }));
 		expect(listPresence(root).map((record) => record.id)).toEqual(["s-1"]);
+	});
+
+	test("readSessions lists every record file but reads only the wanted ones", () => {
+		writePresence(root, presence({ id: "s-1" }));
+		writePresence(root, presence({ id: "s-2" }));
+		writeFileSync(join(sessionsDir(root), "broken.json"), "{");
+		writeFileSync(join(sessionsDir(root), ".s-3.json.123.abcdef01.tmp"), "{");
+		const wanted: string[] = [];
+		const look = readSessions(root, (file) => {
+			wanted.push(file);
+			return file !== "s-1.json";
+		});
+		expect([...look.files]).toEqual(["broken.json", "s-1.json", "s-2.json"]);
+		expect(wanted).toEqual(["broken.json", "s-1.json", "s-2.json"]);
+		expect(look.records.map((record) => record.id)).toEqual(["s-2"]);
+		expect(readSessions(join(root, "nowhere"), () => true)).toEqual({ files: new Set(), records: [] });
 	});
 
 	test("parse fills safe defaults for unknown mode and activity", () => {

@@ -3,7 +3,7 @@ import { describeLive, describeOffline, expectation, formatDirectory, targetLabe
 import { peek } from "../src/core/maildir.ts";
 import { directory, writePresence } from "../src/core/registry.ts";
 import type { Target } from "../src/core/resolve.ts";
-import { canAnswer, findRecipient, liveChildren, post, postExit } from "../src/core/send.ts";
+import { canAnswer, findRecipient, liveChildren, post, postExit, senderOf } from "../src/core/send.ts";
 import { presence, tempRoot } from "./helpers.ts";
 
 let root = "";
@@ -90,9 +90,17 @@ describe("lineage sends", () => {
 	test("postExit drops an ended or died notice from the child", () => {
 		const ended = postExit(root, { id: "k-1", name: "kid", cwd: "/f/1" }, "boss-1", "ended", "all done", 9);
 		expect(ended.ok && [ended.value.kind, ended.value.to, ended.value.from.id, ended.value.text]).toEqual(["ended", "boss-1", "k-1", "all done"]);
-		const died = postExit(root, { id: "k-2" }, "boss-1", "died", "gone", 10);
-		expect(died.ok && died.value.kind).toBe("died");
-		expect(peek(root, "boss-1").map((entry) => (entry.kind === "message" ? entry.message.kind : "?"))).toEqual(["ended", "died"]);
+		const died = postExit(root, { id: "k-2" }, "boss-1", "died", "gone", 10, { pid: 7, startedAt: 3 });
+		expect(died.ok && [died.value.kind, died.value.life]).toEqual(["died", { pid: 7, startedAt: 3 }]);
+		expect(peek(root, "boss-1").map((entry) => (entry.kind === "message" ? [entry.message.kind, entry.message.life?.pid] : "?"))).toEqual([
+			["ended", undefined],
+			["died", 7],
+		]);
+	});
+
+	test("senderOf: a record as a message sender", () => {
+		expect(senderOf(presence({ id: "k-1", name: "kid", cwd: "/f/1" }))).toEqual({ id: "k-1", name: "kid", cwd: "/f/1" });
+		expect(senderOf(presence({ id: "k-2", cwd: "/f/2" }))).toEqual({ id: "k-2", cwd: "/f/2" });
 	});
 });
 
