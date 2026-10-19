@@ -598,8 +598,11 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	const waitFilter = (current: Live, from: string | undefined): Result<{ match: MessageMatch; who: string; id?: string }> => {
 		if (!from?.trim()) return ok({ match: isFrom(undefined), who: "anyone" });
 		if (isChildren(from)) {
-			scan(current, Date.now());
-			return ok({ match: isFromChildOf(current.id, (id) => readSafely(id)?.parent), who: "your children" });
+			const now = Date.now();
+			scan(current, now);
+			const count = liveChildren(root, current.id, now).length;
+			const who = `your children (${count === 0 ? "none" : count} live right now)`;
+			return ok({ match: isFromChildOf(current.id, (id) => readSafely(id)?.parent), who });
 		}
 		const sender = findRecipient(root, current.presence, from, Date.now());
 		if (!sender.ok) return fail(`${sender.error}. msg_list shows who's around`);
