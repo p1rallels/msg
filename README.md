@@ -183,9 +183,11 @@ Message ids are time-sortable (`0mv962x7b-67ef02`: base36 ms + random), so `ls n
   parent's inbox is its memory of what it reported (a `died` names the child's pid and start), and
   delivered messages go after 7 days, so a death over 6 days old by then is never reported. A child
   killed between posting `ended` and marking itself ended (microseconds) reports both
-- **pi-web evicts idle sessions** nobody is viewing after 15 minutes. Their mail waits until the
-  session is opened again; nothing reopens it automatically yet. A session blocked in `msg_wait` is
-  busy, not idle, so an orchestrator waiting on its children stays
+- **pi-web evicts idle sessions** nobody is viewing after 15 minutes. It lists their `new/` every
+  3s and reopens one (no viewer) when mail lands, and msg in it takes the mail; not one that was
+  released, changed elsewhere since, or that another live process runs, and at its session cap the
+  mail waits for a free slot. pi-web only reads the store. A session blocked in `msg_wait` is busy,
+  not idle, so an orchestrator waiting on its children stays
 - **crash window**: a message is claimed into `cur/` just before pi takes it; if the process dies in
   that instant, or before pi persists a queued steer, the message is lost (it stays in `cur/` for
   `msg log` but isn't redelivered)
