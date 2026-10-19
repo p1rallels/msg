@@ -1,12 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync } from "node:fs";
 import { DEATH_WINDOW_MS } from "../src/core/lineage.ts";
-import { allMessages, claim, ensureMailbox, pending } from "../src/core/maildir.ts";
+import { claim, deliver, ensureMailbox, messagesSince, pending } from "../src/core/maildir.ts";
 import type { Message } from "../src/core/message.ts";
 import { type Presence, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
-import { postExit } from "../src/core/send.ts";
 import { type ChildWatch, childrenAfter, filesToRead, lookAfterChildren, newWatch } from "../src/core/watch.ts";
-import { presence, tempRoot } from "./helpers.ts";
+import { message, presence, tempRoot } from "./helpers.ts";
 
 let root = "";
 let cleanup = () => {};
@@ -23,7 +22,7 @@ const alive = () => true;
 const pids = (...dead: number[]) => (pid: number) => !dead.includes(pid);
 const kid = (id: string, overrides: Partial<Presence> = {}): Presence =>
 	presence({ id, parent: BOSS, pid: 100, startedAt: now - 60_000, heartbeatAt: now - 1_000, ...overrides });
-const diedIn = (box: string): Message[] => allMessages(root).flatMap(({ message }) => (message.to === box && message.kind === "died" ? [message] : []));
+const diedIn = (box: string): Message[] => messagesSince(root, box, 0).filter((message) => message.kind === "died");
 const ids = (records: readonly Presence[]) => records.map((record) => record.id);
 
 describe("quick looks", () => {
@@ -135,7 +134,7 @@ describe("deaths are reported once, with the inbox as the evidence", () => {
 
 	test("a notice from an older msg, without a life, counts when it came after the last heartbeat", () => {
 		writePresence(root, kid("k-1", { pid: 7, heartbeatAt: now - 60_000 }));
-		postExit(root, { id: "k-1" }, BOSS, "died", "gone", now - 30_000);
+		deliver(root, message({ to: BOSS, from: { id: "k-1" }, kind: "died", text: "gone" }, now - 30_000));
 		expect(lookAfterChildren(root, BOSS, newWatch(), "full", now, now, pids(7)).posted).toEqual([]);
 	});
 

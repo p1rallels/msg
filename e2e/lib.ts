@@ -1,12 +1,13 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Subprocess } from "bun";
+import { messagesSince } from "../src/core/maildir.ts";
+import type { Message } from "../src/core/message.ts";
 import { listPresence, type Presence } from "../src/core/registry.ts";
 
 export const REPO = resolve(import.meta.dir, "..");
 export const EXTENSION = join(REPO, "src/extension.ts");
-export const CLI = join(REPO, "src/cli.ts");
 export const MODEL = process.env.E2E_MODEL ?? "anthropic/claude-haiku-5-5";
 export const THINKING = process.env.E2E_THINKING ?? "low";
 
@@ -78,17 +79,20 @@ export const waitUntil = async <T>(what: string, probe: () => T | undefined, tim
 export const presenceNamed = (w: World, name: string): Presence | undefined =>
 	listPresence(w.store).find((record) => record.name === name && record.endedAt === undefined);
 
-export interface CliResult {
-	readonly code: number;
-	readonly stdout: string;
-	readonly stderr: string;
-}
-
-export const cli = async (w: World, args: readonly string[], env: Record<string, string> = {}): Promise<CliResult> => {
-	const proc = Bun.spawn(["bun", CLI, ...args], { env: { ...w.env, ...env }, stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-	return { code, stdout, stderr };
+/** A probe for waitUntil: the live record named `name` once it's busy. */
+export const busyNamed = (w: World, name: string) => (): Presence | undefined => {
+	const record = presenceNamed(w, name);
+	return record?.activity === "busy" ? record : undefined;
 };
+
+/** Every message sent to `id`, delivered or not, oldest first. */
+export const inboxOf = (w: World, id: string): Message[] => messagesSince(w.store, id, 0).sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id));
+
+/** The text of every session file in the scenario, for checking that something never ran. */
+export const allSessionText = (w: World): string =>
+	readdirSync(w.sessions)
+		.map((file) => readFileSync(join(w.sessions, file), "utf8"))
+		.join("\n");
 
 export interface Run {
 	readonly proc: Subprocess<"pipe", "pipe", "pipe">;
@@ -152,6 +156,23 @@ export const rpc = (run: Run, command: Record<string, unknown>): void => {
 
 export const customMessages = (entries: readonly Record<string, unknown>[]): Record<string, unknown>[] =>
 	entries.filter((entry) => entry.type === "custom_message" && entry.customType === "msg");
+
+/** The msg messages delivered into a conversation, with what the agent read. */
+export const delivered = (entries: readonly Record<string, unknown>[]): { readonly message: Message; readonly content: string; readonly index: number }[] =>
+	entries.flatMap((entry, index) =>
+		entry.type === "custom_message" && entry.customType === "msg" && typeof entry.details === "object" && entry.details !== null
+			? [{ message: entry.details as Message, content: typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content), index }]
+			: [],
+	);
+
+/** Each assistant message's text, with its place in the session file. */
+export const assistantTexts = (entries: readonly Record<string, unknown>[]): { readonly text: string; readonly index: number }[] =>
+	entries.flatMap((entry, index) => {
+		const message = entry.message as { role?: string; content?: { type?: string; text?: string }[] } | undefined;
+		if (entry.type !== "message" || message?.role !== "assistant") return [];
+		const text = (message.content ?? []).flatMap((part) => (part.type === "text" && part.text ? [part.text] : [])).join("\n");
+		return text ? [{ text, index }] : [];
+	});
 
 export interface Check {
 	readonly name: string;

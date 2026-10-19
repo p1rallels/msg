@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { allMessages, claim, deliver, ensureMailbox, messagesSince, peek, pending, pruneDelivered, unclaim } from "../src/core/maildir.ts";
+import { claim, deliver, ensureMailbox, messagesSince, pending, pruneDelivered, unclaim } from "../src/core/maildir.ts";
 import { message, tempRoot } from "./helpers.ts";
 
 let root = "";
@@ -77,28 +77,6 @@ describe("claim", () => {
 		expect(claimed.length).toBe(total);
 		expect(new Set(claimed).size).toBe(total);
 		expect(pending(root, "bob")).toEqual([]);
-	});
-});
-
-describe("peek", () => {
-	test("reads pending messages without claiming them", () => {
-		const sent = message({ to: "bob" });
-		deliver(root, sent);
-		expect(peek(root, "bob").map((entry) => entry.kind === "message" && entry.message.id)).toEqual([sent.id]);
-		expect(pending(root, "bob")).toEqual([`${sent.id}.json`]);
-	});
-});
-
-describe("allMessages", () => {
-	test("merges every mailbox, pending and delivered, oldest first", () => {
-		const first = message({ to: "bob", text: "1" }, 1_000);
-		const second = message({ to: "alice", text: "2" }, 2_000);
-		const third = message({ to: "bob", text: "3" }, 3_000);
-		[third, first, second].forEach((item) => deliver(root, item));
-		claim(root, "bob", `${first.id}.json`);
-		const stored = allMessages(root);
-		expect(stored.map((entry) => entry.message.text)).toEqual(["1", "2", "3"]);
-		expect(stored.map((entry) => entry.state)).toEqual(["delivered", "pending", "pending"]);
 	});
 });
 

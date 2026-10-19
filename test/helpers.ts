@@ -1,7 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createMessage, type Draft, type Message } from "../src/core/message.ts";
+import { pending } from "../src/core/maildir.ts";
+import { createMessage, type Draft, type Message, parseMessage } from "../src/core/message.ts";
+import { mailboxDirs } from "../src/core/paths.ts";
 import type { Presence } from "../src/core/registry.ts";
 import { unwrap } from "../src/core/result.ts";
 
@@ -20,11 +22,10 @@ export const message = (draft: Partial<Draft> & { to: string }, now = 1_700_000_
 				from: draft.from ?? { id: "sender-1", name: "sender" },
 				to: draft.to,
 				text: draft.text ?? "hello",
-				...(draft.delivery ? { delivery: draft.delivery } : {}),
 				...(draft.replyTo ? { replyTo: draft.replyTo } : {}),
 				...(draft.awaitingUntil !== undefined ? { awaitingUntil: draft.awaitingUntil } : {}),
 				...(draft.kind ? { kind: draft.kind } : {}),
-				...(draft.byUser ? { byUser: true } : {}),
+				...(draft.stopped ? { stopped: true } : {}),
 				...(draft.life ? { life: draft.life } : {}),
 			},
 			now,
@@ -42,3 +43,7 @@ export const presence = (overrides: Partial<Presence> & { id: string }): Presenc
 	heartbeatAt: 10_000,
 	...overrides,
 });
+
+/** The messages waiting in `id`'s new/, oldest first, without claiming them. */
+export const waiting = (root: string, id: string): Message[] =>
+	pending(root, id).map((file) => unwrap(parseMessage(JSON.parse(readFileSync(join(mailboxDirs(root, id).new, file), "utf8")))));

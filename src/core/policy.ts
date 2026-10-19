@@ -1,9 +1,9 @@
-import type { Delivery } from "./message.ts";
+import type { Message, Relation } from "./message.ts";
 import type { Mode } from "./registry.ts";
 
 export type DeliveryAction =
-	/** Into the conversation: steered or queued into the active run, or starting a run when idle. */
-	| { readonly kind: "inject"; readonly deliverAs: Delivery; readonly wakes: boolean }
+	/** Into the conversation: steered into the active run (its next step), or starting a run when idle. */
+	| { readonly kind: "inject"; readonly wakes: boolean }
 	/** Into the conversation without starting a run: the agent sees it on its next turn. */
 	| { readonly kind: "append" }
 	/** Leave it in the inbox for later. */
@@ -19,16 +19,17 @@ export interface SessionState {
 }
 
 /**
- * Print and JSON runs take their prompt after the session starts and exit when it settles, so a
- * message must never start a run there: it only joins a run that's already going. A session busy
- * with something other than its agent loop (a manual compaction, a run still starting) holds the
- * message for the next pump instead of starting a second run.
+ * Messages are always steered: a running session sees one at its next step. Print and JSON runs take
+ * their prompt after the session starts and exit when it settles, so a message must never start a run
+ * there: it only joins a run that's already going. A session busy with something other than its agent
+ * loop (a manual compaction, a run still starting) holds the message for the next pump instead of
+ * starting a second run.
  */
-export const deliveryAction = (state: SessionState, delivery: Delivery): DeliveryAction => {
-	if (!state.idle) return state.streaming ? { kind: "inject", deliverAs: delivery, wakes: false } : { kind: "hold" };
+export const deliveryAction = (state: SessionState): DeliveryAction => {
+	if (!state.idle) return state.streaming ? { kind: "inject", wakes: false } : { kind: "hold" };
 	if (state.mode === "print" || state.mode === "json") return { kind: "hold" };
 	if (!state.wakeAllowed) return { kind: "append" };
-	return { kind: "inject", deliverAs: delivery, wakes: true };
+	return { kind: "inject", wakes: true };
 };
 
 export interface WakeBudget {
@@ -37,6 +38,13 @@ export interface WakeBudget {
 }
 
 export const DEFAULT_WAKE_BUDGET: WakeBudget = { max: 20, windowMs: 10 * 60_000 };
+
+/**
+ * A sub's messages and exit notices always wake its parent and never count against its budget: a parent waits
+ * for them with its turn ended, and a sub can't ping-pong (an idle `pi -p` is never woken).
+ */
+export const outsideBudget = (message: Pick<Message, "kind">, relation: Relation | undefined): boolean =>
+	message.kind !== undefined || relation === "child";
 
 /** Wakes inside the window. Two agents that keep answering each other run out; a human prompt resets it. */
 export const recentWakes = (wakes: readonly number[], now: number, budget: WakeBudget): number[] =>

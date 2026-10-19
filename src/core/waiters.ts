@@ -63,19 +63,8 @@ export const createWaiters = (): Waiters => {
 	return { wait, offer, size: () => entries.length, cancelAll };
 };
 
-/** A reply to `sent`: from its recipient, and either pointing at it or not pointing anywhere. */
+/** A reply to `sent`: from its recipient, and either pointing at it or not pointing anywhere. Its `ended` or `died` too. */
 export const isReplyTo =
 	(sent: Pick<Message, "id" | "to">): MessageMatch =>
 	(message) =>
 		message.from.id === sent.to && (message.replyTo === undefined || message.replyTo === sent.id);
-
-export const isFrom =
-	(senderId: string | undefined): MessageMatch =>
-	(message) =>
-		senderId === undefined || message.from.id === senderId;
-
-/** From any session whose record names `parentId` as its parent, looked up when the message arrives. */
-export const isFromChildOf =
-	(parentId: string, parentOf: (id: string) => string | undefined): MessageMatch =>
-	(message) =>
-		parentOf(message.from.id) === parentId;

@@ -1,9 +1,9 @@
 import { statSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { ensureDir, isMissing, listDirs, listJsonFiles, moveIfPresent, parseJson, readTextOrUndefined, writeFileAtomic } from "./fsx.ts";
+import { ensureDir, isMissing, listJsonFiles, moveIfPresent, parseJson, readTextOrUndefined, writeFileAtomic } from "./fsx.ts";
 import { timeOfMessageId } from "./ids.ts";
 import { type Message, parseMessage } from "./message.ts";
-import { inboxesDir, type MailboxDirs, mailboxDirs } from "./paths.ts";
+import { type MailboxDirs, mailboxDirs } from "./paths.ts";
 import { fail, ok, type Result } from "./result.ts";
 
 export const ensureMailbox = (root: string, id: string): MailboxDirs => {
@@ -53,35 +53,6 @@ export const unclaim = (root: string, id: string, file: string): boolean => {
 	const dirs = mailboxDirs(root, id);
 	return moveIfPresent(join(dirs.cur, file), join(dirs.new, file));
 };
-
-export const peek = (root: string, id: string): Claim[] => {
-	const dirs = mailboxDirs(root, id);
-	return pending(root, id).flatMap((file): Claim[] => {
-		const message = readMessage(join(dirs.new, file));
-		if (message.ok) return [{ kind: "message", file, message: message.value }];
-		return message.error === "file vanished" ? [] : [{ kind: "invalid", file, error: message.error }];
-	});
-};
-
-export interface StoredMessage {
-	readonly message: Message;
-	readonly state: "pending" | "delivered";
-}
-
-const readBox = (dir: string, state: StoredMessage["state"]): StoredMessage[] =>
-	listJsonFiles(dir).flatMap((file) => {
-		const message = readMessage(join(dir, file));
-		return message.ok ? [{ message: message.value, state }] : [];
-	});
-
-/** Every stored message (all mailboxes), oldest first. Fine at agent-chat scale; not an index. */
-export const allMessages = (root: string): StoredMessage[] =>
-	listDirs(inboxesDir(root))
-		.flatMap((id) => {
-			const dirs = mailboxDirs(root, id);
-			return [...readBox(dirs.new, "pending"), ...readBox(dirs.cur, "delivered")];
-		})
-		.sort((a, b) => a.message.ts - b.message.ts || a.message.id.localeCompare(b.message.id));
 
 const sentAt = (file: string): number | undefined => timeOfMessageId(file.replace(/\.json$/, ""));
 

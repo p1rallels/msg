@@ -2,15 +2,12 @@
 	"name": "msg-cli",
 	"version": "0.1.0",
 	"private": true,
-	"description": "Agent-to-agent messaging for pi sessions: a pi extension (msg_list, msg_send, msg_wait) and a msg CLI over one maildir store",
+	"description": "Agent-to-agent messaging for pi sessions: a pi extension (msg_list, msg_send) over one maildir store",
 	"type": "module",
 	"keywords": [
 		"pi-package"
 	],
 	"license": "MIT",
-	"bin": {
-		"msg": "./src/cli.ts"
-	},
 	"pi": {
 		"extensions": [
 			"./src/extension.ts"
@@ -20,17 +17,14 @@
 		"test": "bun test",
 		"typecheck": "tsc --noEmit",
 		"check": "tsc --noEmit && bun test",
-		"msg": "bun src/cli.ts",
 		"e2e": "bun e2e/run.ts"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "1.2.0",
 		"@earendil-works/pi-coding-agent": "1.2.0",
 		"@earendil-works/pi-tui": "1.2.0",
 		"@types/bun": "^1.4.3",

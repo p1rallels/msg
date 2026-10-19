@@ -1,18 +1,21 @@
 import { resolve } from "node:path";
-import { partyLabel } from "./message.ts";
+import { ago, exactLabel } from "./message.ts";
 import type { Directory, Presence } from "./registry.ts";
 import { fail, ok, type Result } from "./result.ts";
 
-export const MIN_PREFIX = 4;
 export const PARENT = "parent";
 export const CHILDREN = "children";
+/** A query this long that names nothing makes the sessions whose id starts with it likely. */
+export const MIN_PREFIX = 4;
+/** How many likely sessions an error names. */
+export const LIKELY_LISTED = 3;
 
 export interface Target {
 	readonly id: string;
 	/** Missing only for a parent that has never run msg: its inbox keeps the mail all the same. */
 	readonly presence?: Presence;
 	readonly live: boolean;
-	readonly via: "id" | "parent" | "folder" | "name" | "prefix" | "children";
+	readonly via: "id" | "parent" | "folder" | "name" | "children";
 }
 
 /** Who's asking: `parent`, `./x` and family-first names mean different sessions to different askers. */
@@ -42,15 +45,15 @@ export const folderOf = (query: string, cwd: string, home: string): string | und
 	return resolve(cwd, query);
 };
 
-const describe = (records: readonly Presence[]): string => records.map((record) => `${partyLabel(record)} (${record.id})`).join(", ");
+const describe = (records: readonly Presence[]): string => records.map(exactLabel).join(", ");
 
 const sameName = (query: string) => (record: Presence) => record.name?.toLowerCase() === query.toLowerCase();
 
-const unique = (matches: readonly Presence[], query: string, kind: string): Result<Presence> | undefined => {
+const unique = (matches: readonly Presence[], query: string): Result<Presence> | undefined => {
 	if (matches.length === 0) return undefined;
 	const [only] = matches;
 	if (matches.length === 1 && only) return ok(only);
-	return fail(`${kind} "${query}" is ambiguous: ${describe(matches)}. Use the full session id.`);
+	return fail(`name "${query}" is ambiguous: ${describe(matches)}. Use the exact session id.`);
 };
 
 const preferFamily = (matches: readonly Presence[], asker: Asker): readonly Presence[] => {
@@ -60,17 +63,28 @@ const preferFamily = (matches: readonly Presence[], asker: Asker): readonly Pres
 
 const identity = (path: string): string => path;
 
+const seen = (record: Presence, live: boolean, now: number): string => {
+	if (live) return "live now";
+	return record.endedAt === undefined ? `last seen ${ago(record.heartbeatAt, now)}` : `ended ${ago(record.endedAt, now)}`;
+};
+
 /**
- * Finds the one session `query` names, never the asker (leave it out of `dir`). Order: exact id,
- * `parent`, a folder (the live session working there, else the last one seen there), a live name
- * (your parent and children first), a unique id prefix (≥4 chars), the most recently seen offline name.
+ * Finds the one session `query` names, never the asker (leave it out of `dir`), and never by a guess: an exact id
+ * (live or offline), `parent`, a folder with exactly one live session, or a live name (your parent and children
+ * first). When nothing live matches a folder or a name, the error names the likely sessions with their exact ids
+ * and when each was last seen, so messaging one of them is a deliberate second step.
  */
-export const resolveTarget = (rawQuery: string, dir: Directory, asker: Asker, lookup: Lookup): Result<Target> => {
+export const resolveTarget = (rawQuery: string, dir: Directory, asker: Asker, lookup: Lookup, now: number): Result<Target> => {
 	const query = cleanQuery(rawQuery);
 	if (!query) return fail("recipient is empty");
 	const all = [...dir.live, ...dir.offline];
 	const liveIds = new Set(dir.live.map((record) => record.id));
 	const found = (presence: Presence, via: Target["via"]): Result<Target> => ok({ id: presence.id, presence, live: liveIds.has(presence.id), via });
+	const likely = (records: readonly Presence[]): string =>
+		records
+			.slice(0, LIKELY_LISTED)
+			.map((record) => `${exactLabel(record)}, ${seen(record, liveIds.has(record.id), now)}`)
+			.join("; ");
 
 	const exact = all.find((record) => record.id === query);
 	if (exact) return found(exact, "id");
@@ -81,7 +95,7 @@ export const resolveTarget = (rawQuery: string, dir: Directory, asker: Asker, lo
 		return record ? found(record, "parent") : ok({ id: asker.parent, live: false, via: "parent" });
 	}
 
-	if (query.toLowerCase() === CHILDREN) return fail(`"${CHILDREN}" names a group: msg_send fans out to every live child, msg_wait takes any child`);
+	if (query.toLowerCase() === CHILDREN) return fail(`"${CHILDREN}" names a group, not one session`);
 
 	const folder = folderOf(query, asker.cwd ?? lookup.home, lookup.home);
 	if (folder !== undefined) {
@@ -90,21 +104,18 @@ export const resolveTarget = (rawQuery: string, dir: Directory, asker: Asker, lo
 		const here = (record: Presence) => record.cwd !== "" && canonical(record.cwd) === wanted;
 		const live = dir.live.filter(here);
 		const [only] = live;
-		if (live.length > 1) return fail(`${live.length} live sessions work in ${folder}: ${describe(live)}. Use a session id.`);
+		if (live.length > 1) return fail(`${live.length} live sessions work in ${folder}: ${describe(live)}. Use the exact session id.`);
 		if (only) return found(only, "folder");
-		const last = dir.offline.find(here);
-		return last ? found(last, "folder") : fail(`no session works in ${folder}`);
+		const before = dir.offline.filter(here);
+		if (before.length === 0) return fail(`no session works in ${folder}`);
+		return fail(`nobody live works in ${folder}. Last there: ${likely(before)}. To message one of them anyway, use its exact id.`);
 	}
 
-	const liveName = unique(preferFamily(dir.live.filter(sameName(query)), asker), query, "name");
-	if (liveName) return liveName.ok ? found(liveName.value, "name") : liveName;
+	const named = unique(preferFamily(dir.live.filter(sameName(query)), asker), query);
+	if (named) return named.ok ? found(named.value, "name") : named;
 
-	const prefixed = query.length >= MIN_PREFIX ? unique(all.filter((record) => record.id.startsWith(query)), query, "id prefix") : undefined;
-	if (prefixed) return prefixed.ok ? found(prefixed.value, "prefix") : prefixed;
-
-	const offlineName = dir.offline.find(sameName(query));
-	if (offlineName) return found(offlineName, "name");
-
+	const candidates = all.filter((record) => sameName(query)(record) || (query.length >= MIN_PREFIX && record.id.startsWith(query)));
+	if (candidates.length > 0) return fail(`"${query}" is no live session's name and no session's exact id. Likely: ${likely(candidates)}. To message one of them, use its exact id.`);
 	const known = dir.live.length > 0 ? `live sessions: ${describe(dir.live)}` : "no live sessions right now";
 	return fail(`no session matches "${query}" (${known})`);
 };

@@ -64,7 +64,7 @@ const byId = (messages: readonly Message[]): Message[] => [...new Map(messages.m
 /** Into your own inbox, from the child, naming its life, and never dated before the heartbeat it follows. */
 const postDied = (root: string, selfId: string, death: Death, now: number): Result<Message> => {
 	try {
-		return postExit(root, senderOf(death.child), selfId, "died", diedText(death, now), Math.max(now, death.child.heartbeatAt), lifeOf(death.child));
+		return postExit(root, senderOf(death.child), selfId, { kind: "died", life: lifeOf(death.child) }, diedText(death, now), Math.max(now, death.child.heartbeatAt));
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
 	}

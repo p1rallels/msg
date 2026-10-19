@@ -1,23 +1,22 @@
 import { type FSWatcher, watch } from "node:fs";
 import { homedir } from "node:os";
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { MSG_COMMAND_USAGE, parseMsgCommand, recipientCompletions } from "./core/command.ts";
-import { expectation, formatDirectory, targetLabel } from "./core/format.ts";
+import { expectation, formatDirectory, headline, replyText, targetLabel } from "./core/format.ts";
+import { LIST_ALL, LIST_DESCRIPTION, MAX_WAIT_SECONDS, PROMPT_GUIDELINES, PROMPT_SNIPPET, SEND_DESCRIPTION, SEND_TO } from "./core/guide.ts";
 import { DELIVERED_TTL_MS, OFFLINE_TTL_MS, sweepOrphans } from "./core/housekeeping.ts";
-import { assistantWords, endedText, inheritedParent, lastWordsIn, relationOf } from "./core/lineage.ts";
+import { assistantWords, endedText, lastWordsIn, relationOf, type RunState, startAs, wasStopped } from "./core/lineage.ts";
 import { ensureMailbox, pruneDelivered } from "./core/maildir.ts";
-import { type Delivery, type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
+import { type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
 import { isValidId, mailboxDirs, msgRoot } from "./core/paths.ts";
-import { DEFAULT_WAKE_BUDGET, deliveryAction, recentWakes, type SessionState, wakeAllowed } from "./core/policy.ts";
+import { DEFAULT_WAKE_BUDGET, deliveryAction, outsideBudget, recentWakes, type SessionState, wakeAllowed } from "./core/policy.ts";
 import { pumpOnce } from "./core/pump.ts";
-import { directory, HEARTBEAT_EVERY_MS, listPresence, type Mode, type Presence, pruneOffline, readPresence, writePresence } from "./core/registry.ts";
-import { isChildren, type Target } from "./core/resolve.ts";
+import { directory, HEARTBEAT_EVERY_MS, type Mode, type Presence, pruneOffline, readPresence, writePresence } from "./core/registry.ts";
+import type { Target } from "./core/resolve.ts";
 import { fail, ok, type Result } from "./core/result.ts";
-import { canAnswer, findRecipient, liveChildren, type Outgoing, post, postExit, senderOf } from "./core/send.ts";
-import { createWaiters, isFrom, isFromChildOf, isReplyTo, type MessageMatch, type Waiters, type WaitOutcome } from "./core/waiters.ts";
+import { canAnswer, findRecipients, type Outgoing, post, postExit, senderOf } from "./core/send.ts";
+import { createWaiters, isReplyTo, type Waiters } from "./core/waiters.ts";
 import { type ChildWatch, lookAfterChildren, newWatch, type Scope } from "./core/watch.ts";
 
 const CUSTOM_TYPE = "msg";
@@ -28,8 +27,6 @@ const SCAN_EVERY_MS = HEARTBEAT_EVERY_MS;
 const WAKE_GAP_MS = 10_000;
 const PUMP_DEBOUNCE_MS = 25;
 const STARTUP_GRACE_MS = 3_000;
-const DEFAULT_WAIT_SECONDS = 300;
-const MAX_WAIT_SECONDS = 3_600;
 const MAX_OFFLINE_LISTED = 15;
 const COLLAPSED_LINES = 12;
 
@@ -47,7 +44,7 @@ interface Live {
 	/** Messages whose sender is blocked waiting for our reply: id -> who and until when. */
 	awaited: Map<string, { readonly from: string; readonly until: number }>;
 	status: string | undefined;
-	/** The children this session looks after, and the deaths it already reported. */
+	/** The subs this session looks after, and the deaths it already reported. */
 	watch: ChildWatch;
 	lastScanAt: number;
 	lastTickAt: number;
@@ -55,10 +52,14 @@ interface Live {
 	awakeSince: number;
 	/** The newest assistant text: the report an `ended` notice carries to the parent. */
 	lastWords: string | undefined;
+	/** Where the agent's runs stand: an `ended` from a session that goes away mid-run, or after an aborted run, says `stopped`. */
+	run: RunState;
 }
 
 /** How a session stops: `ended` tells its parent (it's over), `quiet` doesn't (a reload, a restart of the same session). */
 type Stop = "ended" | "quiet";
+
+type Level = "info" | "warning" | "error";
 
 type ToolText = { type: "text"; text: string };
 const toolText = (text: string): ToolText[] => [{ type: "text", text }];
@@ -67,10 +68,7 @@ const toolText = (text: string): ToolText[] => [{ type: "text", text }];
 const hostMode = (mode: ExtensionContext["mode"]): Mode =>
 	mode === "rpc" && process.argv.some((arg) => arg.includes("pi-web")) ? "web" : mode;
 
-const clampSeconds = (value: number | undefined, fallback: number): number =>
-	Math.min(MAX_WAIT_SECONDS, Math.max(0, Math.round(value ?? fallback)));
-
-const toDelivery = (value: "steer" | "follow_up" | undefined): Delivery => (value === "follow_up" ? "followUp" : "steer");
+const clampSeconds = (value: number | undefined): number => Math.min(MAX_WAIT_SECONDS, Math.max(0, Math.round(value ?? 0)));
 
 const withName = (presence: Presence, name: string | undefined): Presence => {
 	const { name: _replaced, ...rest } = presence;
@@ -84,27 +82,12 @@ const clipLines = (text: string, max: number): string => {
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-const describeReply = (outcome: WaitOutcome, who: string, seconds: number): string => {
-	switch (outcome.kind) {
-		case "message": {
-			const { message } = outcome;
-			if (message.kind === "ended") return `${who} ended before replying. Its final message:\n${message.text}`;
-			if (message.kind === "died") return `${who} died before replying: ${message.text}`;
-			const by = message.byUser ? `Your user replied through ${who}` : `${who} replied`;
-			return `${by} (${message.id}):\n${message.text}`;
-		}
-		case "timeout":
-			return `No reply from ${who} within ${seconds}s. A later reply arrives as a normal message.`;
-		case "aborted":
-			return `Stopped waiting for ${who}. A later reply arrives as a normal message.`;
+const tell = (ctx: ExtensionContext, text: string, level: Level): void => {
+	try {
+		if (ctx.hasUI) ctx.ui.notify(text, level);
+	} catch {
+		// the session is going away; nothing to tell
 	}
-};
-
-const headline = (message: Message): string => {
-	const who = partyLabel(message.from);
-	if (message.kind === "ended") return `✉ ${who} ended`;
-	if (message.kind === "died") return `✉ ${who} died`;
-	return message.byUser ? `✉ your user via ${who}` : `✉ ${who}`;
 };
 
 export default function msgExtension(pi: ExtensionAPI): void {
@@ -113,14 +96,8 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	let live: Live | undefined;
 	/** Why msg couldn't start in this session, for the tools to explain. */
 	let unavailable: string | undefined;
-
-	const notify = (current: Live, text: string, level: "info" | "warning" | "error"): void => {
-		try {
-			if (current.ctx.hasUI) current.ctx.ui.notify(text, level);
-		} catch {
-			// the session is going away; nothing to tell
-		}
-	};
+	/** Why this session must not run at all: it was started from a sub's bash. */
+	let refused: string | undefined;
 
 	const savePresence = (current: Live, presence: Presence): void => {
 		current.presence = presence;
@@ -139,22 +116,15 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const listSafely = (): Presence[] => {
-		try {
-			return listPresence(root);
-		} catch {
-			return [];
-		}
-	};
-
 	const relationTo = (current: Live, senderId: string): Relation | undefined => relationOf(current.presence, senderId, readSafely(senderId));
 
-	/** A child that ends tells its parent, with its last words. Mail to an offline parent waits in its inbox. */
+	/** A sub that ends tells its parent: its whole final message, and whether it was stopped before finishing. */
 	const reportEnd = (current: Live, now: number): void => {
 		const parent = current.presence.parent;
 		if (parent === undefined) return;
 		try {
-			const posted = postExit(root, senderOf(current.presence), parent, "ended", endedText(current.lastWords, current.id), now);
+			const exit = { kind: "ended", stopped: wasStopped(current.run) } as const;
+			const posted = postExit(root, senderOf(current.presence), parent, exit, endedText(current.lastWords, current.id), now);
 			if (!posted.ok) console.error(`[msg] could not tell the parent session this one ended: ${posted.error}`);
 		} catch (error) {
 			console.error(`[msg] could not tell the parent session this one ended: ${errorText(error)}`);
@@ -179,11 +149,11 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	};
 
 	/** Throws once pi has disposed the session (pi-web disposes without session_shutdown). */
-	const sessionState = (current: Live, now: number): SessionState => ({
+	const sessionState = (current: Live, now: number, exempt = false): SessionState => ({
 		mode: current.mode,
 		idle: current.ctx.isIdle(),
 		streaming: current.ctx.signal !== undefined,
-		wakeAllowed: wakeAllowed(current.wakes, now, DEFAULT_WAKE_BUDGET),
+		wakeAllowed: exempt || wakeAllowed(current.wakes, now, DEFAULT_WAKE_BUDGET),
 	});
 
 	const accepting = (current: Live): boolean => {
@@ -191,7 +161,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		const now = Date.now();
 		const state = sessionState(current, now);
 		if (state.idle && now - current.startedAt < STARTUP_GRACE_MS) return false;
-		return deliveryAction(state, "steer").kind !== "hold";
+		return deliveryAction(state).kind !== "hold";
 	};
 
 	const rememberAwaited = (current: Live, message: Message, now: number): void => {
@@ -211,8 +181,8 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		if (!current.ctx.hasUI) return;
 		const dir = directory(records, now);
 		const peers = dir.live.filter((record) => record.id !== current.id).length;
-		const children = dir.live.filter((record) => record.parent === current.id).length;
-		const text = [`✉ ${partyLabel(current.presence)}`, ...(children > 0 ? [`${children} children`] : []), ...(peers > 0 ? [`${peers} live`] : [])].join(" · ");
+		const subs = dir.live.filter((record) => record.parent === current.id).length;
+		const text = [`✉ ${partyLabel(current.presence)}`, ...(subs > 0 ? [`${subs} subs`] : []), ...(peers > 0 ? [`${peers} live`] : [])].join(" · ");
 		if (text === current.status) return;
 		current.status = text;
 		current.ctx.ui.setStatus(STATUS_KEY, text);
@@ -220,8 +190,10 @@ export default function msgExtension(pi: ExtensionAPI): void {
 
 	const inject = (current: Live, message: Message): "delivered" | "held" => {
 		const now = Date.now();
-		const action = deliveryAction(sessionState(current, now), message.delivery);
-		const content = renderForAgent(message, now, relationTo(current, message.from.id));
+		const relation = relationTo(current, message.from.id);
+		const exempt = outsideBudget(message, relation);
+		const action = deliveryAction(sessionState(current, now, exempt));
+		const content = renderForAgent(message, now, relation);
 		const custom = { customType: CUSTOM_TYPE, content, display: true, details: message };
 		switch (action.kind) {
 			case "hold":
@@ -229,12 +201,12 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			case "append":
 				pi.sendMessage(custom, { triggerTurn: false });
 				rememberAwaited(current, message, now);
-				notify(current, `msg: ${partyLabel(message.from)} wrote, but this session woke ${DEFAULT_WAKE_BUDGET.max}x without you; not waking it again until you prompt`, "warning");
+				tell(current.ctx, `msg: ${partyLabel(message.from)} wrote, but this session woke ${DEFAULT_WAKE_BUDGET.max}x without you; not waking it again until you prompt`, "warning");
 				return "delivered";
 			case "inject":
-				pi.sendMessage(custom, { triggerTurn: true, deliverAs: action.deliverAs });
+				pi.sendMessage(custom, { triggerTurn: true, deliverAs: "steer" });
 				rememberAwaited(current, message, now);
-				if (action.wakes && message.kind === undefined) current.wakes = [...recentWakes(current.wakes, now, DEFAULT_WAKE_BUDGET), now];
+				if (action.wakes && !exempt) current.wakes = [...recentWakes(current.wakes, now, DEFAULT_WAKE_BUDGET), now];
 				return "delivered";
 		}
 	};
@@ -265,7 +237,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 				offer: current.waiters.offer,
 				deliver: (message) => inject(current, message),
 			});
-			if (report.invalid.length > 0) notify(current, `msg: skipped ${report.invalid.length} unreadable message file(s)`, "warning");
+			if (report.invalid.length > 0) tell(current.ctx, `msg: skipped ${report.invalid.length} unreadable message file(s)`, "warning");
 			if (report.failure !== undefined) handleFailure(current, report.failure);
 		} catch (error) {
 			handleFailure(current, error);
@@ -283,9 +255,8 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Looks after the children: every record on a full look, else only new and outdated ones. A child
-	 * that went offline without ending gets a `died` notice in our own inbox, delivered like any message.
-	 * Returns the records read.
+	 * Looks after the subs: every record on a full look, else only new and outdated ones. A sub that went
+	 * offline without ending gets a `died` notice in our own inbox, delivered like any message. Returns the records read.
 	 */
 	const watchFamily = (current: Live, now: number, scope: Scope): readonly Presence[] => {
 		try {
@@ -357,14 +328,12 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const begin = (ctx: ExtensionContext): void => {
-		const id = ctx.sessionManager.getSessionId();
+	const begin = (ctx: ExtensionContext, id: string, mode: Mode, parent: string | undefined): void => {
 		if (!isValidId(id)) throw new Error(`session id ${JSON.stringify(id)} can't name a mailbox`);
 		ensureMailbox(root, id);
 		const now = Date.now();
 		const name = normalizeName(pi.getSessionName());
-		const mode = hostMode(ctx.mode);
-		const parent = inheritedParent(process.env, id, mode);
+		const idle = ctx.isIdle();
 		const presence: Presence = {
 			v: 1,
 			id,
@@ -373,7 +342,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			cwd: ctx.cwd,
 			pid: process.pid,
 			mode,
-			activity: ctx.isIdle() ? "idle" : "busy",
+			activity: idle ? "idle" : "busy",
 			startedAt: now,
 			heartbeatAt: now,
 		};
@@ -400,6 +369,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			lastTickAt: now,
 			awakeSince: now,
 			lastWords: lastWordsIn(ctx.sessionManager.getBranch()),
+			run: idle ? "none" : "running",
 		};
 		live = current;
 		current.watcher = watchInbox(current);
@@ -407,11 +377,28 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		housekeeping(id, now);
 	};
 
+	/** A pi started from a sub's bash: say why on stderr and as a notice, and stop before it does any work. */
+	const refuse = (ctx: ExtensionContext, reason: string): void => {
+		refused = reason;
+		console.error(`[msg] ${reason}`);
+		tell(ctx, reason, "error");
+		if (ctx.mode === "print" || ctx.mode === "json") process.exitCode = 1;
+		ctx.shutdown();
+	};
+
 	const start = (ctx: ExtensionContext): void => {
-		stop(live !== undefined && live.id !== ctx.sessionManager.getSessionId() ? "ended" : "quiet");
+		const id = ctx.sessionManager.getSessionId();
+		stop(live !== undefined && live.id !== id ? "ended" : "quiet");
 		unavailable = undefined;
+		refused = undefined;
+		const mode = hostMode(ctx.mode);
+		const plan = startAs(process.env, id, mode, readSafely);
+		if (plan.kind === "refuse") {
+			refuse(ctx, plan.reason);
+			return;
+		}
 		try {
-			begin(ctx);
+			begin(ctx, id, mode, plan.parent);
 		} catch (error) {
 			stop("quiet");
 			unavailable = `msg can't use its store at ${root}: ${errorText(error)}. Point PI_MSG_DIR at a folder this session can write.`;
@@ -421,17 +408,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 
 	const requireLive = (): Live => {
 		if (live) return live;
-		throw new Error(unavailable ?? "msg is not running in this session (it starts with the session; try again in a moment)");
-	};
-
-	/** One session, or every live child for `children`. */
-	const recipientsOf = (current: Live, to: string, now: number): Result<Target[]> => {
-		if (isChildren(to)) {
-			const children = liveChildren(root, current.id, now);
-			return children.length > 0 ? ok(children) : fail("you have no live children (msg_list shows your family)");
-		}
-		const found = findRecipient(root, current.presence, to, now);
-		return found.ok ? ok([found.value]) : fail(`${found.error}. msg_list shows who's around`);
+		throw new Error(refused ?? unavailable ?? "msg is not running in this session (it starts with the session; try again in a moment)");
 	};
 
 	const sendAll = (current: Live, targets: readonly Target[], outgoing: Outgoing, now: number): Result<{ target: Target; message: Message }[]> => {
@@ -446,8 +423,20 @@ export default function msgExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => start(ctx));
 	pi.on("session_shutdown", (event) => stop(event.reason === "reload" ? "quiet" : "ended"));
-	pi.on("input", (event) => {
+	pi.on("input", (event, ctx) => {
+		if (refused !== undefined) {
+			tell(ctx, refused, "error");
+			return { action: "handled" as const };
+		}
 		if (event.source !== "extension" && live) live.wakes = [];
+		return undefined;
+	});
+	pi.on("agent_start", (_event, ctx) => {
+		if (refused !== undefined) ctx.abort();
+		else if (live) live.run = "running";
+	});
+	pi.on("agent_settled", (event) => {
+		if (live) live.run = event.aborted ? "aborted" : "finished";
 	});
 	pi.on("message_end", (event) => {
 		const words = assistantWords(event.message);
@@ -465,56 +454,17 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		return box;
 	});
 
-	pi.registerCommand("msg", {
-		description: "Message another session as its user: /msg <to> <text> (to: parent, children, a folder, a name or an id)",
-		getArgumentCompletions: (prefix) => {
-			const current = live;
-			return current ? recipientCompletions(prefix, directory(listSafely(), Date.now()).live, current.presence) : null;
-		},
-		handler: async (args, ctx) => {
-			const say = (text: string, level: "info" | "warning" | "error"): void => {
-				if (ctx.hasUI) ctx.ui.notify(text, level);
-				else console.error(text);
-			};
-			const current = live;
-			if (!current) return say(unavailable ?? "msg is not running in this session", "error");
-			const command = parseMsgCommand(args);
-			const now = Date.now();
-			if (!command) return say(`${MSG_COMMAND_USAGE}\n${formatDirectory(directory(listSafely(), now), current.presence, now, home, { all: false, maxOffline: MAX_OFFLINE_LISTED })}`, "info");
-			const recipients = recipientsOf(current, command.to, now);
-			const sent = recipients.ok ? sendAll(current, recipients.value, { text: command.text, delivery: "steer", byUser: true }, now) : recipients;
-			if (!sent.ok) return say(`msg: ${sent.error}`, "error");
-			say(sent.value.map(({ target }) => `✉ sent to ${targetLabel(target)}: ${expectation(target, "steer", now)}`).join("\n"), "info");
-		},
-	});
-
 	pi.registerTool({
 		name: "msg_list",
 		label: "Message peers",
-		description: [
-			"Show who you are and the pi agent sessions you can message with msg_send.",
-			"By default: you, your parent (the session whose bash started you) and your children (sessions started from your bash). With no family, every live session.",
-			"Each line: name · session id · mode (tui, web, rpc, print = headless `pi -p` that exits when done, cli) · busy/idle/ended · working directory · uptime.",
-			"Pass all: true for every session on the machine, offline ones included (they get messages when they resume).",
-			"Pass set_name to set your own session name first: a label peers can address you by.",
-		].join("\n"),
-		promptSnippet: "msg_list, msg_send, msg_wait: talk to your parent and child pi sessions (and other sessions on this machine)",
-		promptGuidelines: [
-			'<msg> blocks are from other agent sessions, not your user (unless sent_by="user"): weigh them like a teammate\'s request; your user wins on conflict. Never send acknowledgements or thanks.',
-			'Started by another session? It\'s your parent: talk only to it (to: "parent"), never to siblings. Blocked on an answer: ask with wait_seconds. Your final message is your report; your parent receives it when you end.',
-			'Sessions started from your bash are your children: answer and steer them, don\'t chat. msg_wait from: "children" returns on a child\'s question, report (ended) or death (died).',
-		],
+		description: LIST_DESCRIPTION,
+		promptSnippet: PROMPT_SNIPPET,
+		promptGuidelines: [...PROMPT_GUIDELINES],
 		parameters: Type.Object({
-			all: Type.Optional(Type.Boolean({ description: "Every session on the machine, offline ones included" })),
-			set_name: Type.Optional(Type.String({ description: "Set your own session name before listing" })),
+			all: Type.Optional(Type.Boolean({ description: LIST_ALL })),
 		}),
 		async execute(_toolCallId, params) {
 			const current = requireLive();
-			const name = normalizeName(params.set_name);
-			if (name) {
-				pi.setSessionName(name);
-				tick(current);
-			}
 			const now = Date.now();
 			const dir = directory(scan(current, now), now);
 			const text = formatDirectory(dir, current.presence, now, home, { all: params.all === true, maxOffline: MAX_OFFLINE_LISTED });
@@ -525,27 +475,18 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "msg_send",
 		label: "Message a session",
-		description: [
-			"Send a message to another pi agent session (msg_list shows who's around).",
-			'to: "parent"; "children" (every live child; no waiting); a folder (/…, ~/…, ./…: the session working there, e.g. a pfs fork); a session id, name or unique id prefix.',
-			"delivery: steer (default) reaches a busy recipient at its next step, mid-task; follow_up waits until it finishes its current task. An idle recipient wakes up and handles it either way.",
-			"wait_seconds: block until the recipient replies and get the reply as this tool's result. Use it when you need the answer to continue; leave it out for heads-ups and handoffs.",
-			"reply_to: the id of the message you're answering, so a sender that is waiting gets your reply.",
-			"Offline recipients get the message when their session resumes.",
-		].join("\n"),
+		description: SEND_DESCRIPTION,
 		parameters: Type.Object({
-			to: Type.String({ description: 'Recipient: "parent", "children", a folder path, or a session id, name or unique id prefix' }),
+			to: Type.String({ description: SEND_TO }),
 			message: Type.String({ description: "The message text" }),
 			reply_to: Type.Optional(Type.String({ description: "Id of the message you are answering" })),
 			wait_seconds: Type.Optional(Type.Number({ description: `Block up to this long for a reply (max ${MAX_WAIT_SECONDS})` })),
-			delivery: Type.Optional(StringEnum(["steer", "follow_up"] as const, { description: "steer (default): next step; follow_up: after its current task" })),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate) {
 			const current = requireLive();
-			const requestedWait = clampSeconds(params.wait_seconds, 0);
-			const delivery = toDelivery(params.delivery);
+			const requestedWait = clampSeconds(params.wait_seconds);
 			const now = Date.now();
-			const recipients = recipientsOf(current, params.to, now);
+			const recipients = findRecipients(root, current.presence, params.to, now);
 			if (!recipients.ok) throw new Error(recipients.error);
 			const targets = recipients.value;
 			const [single] = targets;
@@ -554,19 +495,19 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			const sent = sendAll(
 				current,
 				targets,
-				{ text: params.message, delivery, ...(replyTo ? { replyTo } : {}), ...(waitSeconds > 0 ? { awaitingUntil: now + waitSeconds * 1_000 } : {}) },
+				{ text: params.message, ...(replyTo ? { replyTo } : {}), ...(waitSeconds > 0 ? { awaitingUntil: now + waitSeconds * 1_000 } : {}) },
 				now,
 			);
 			if (!sent.ok) throw new Error(sent.error);
 			const lines = sent.value.map(({ target, message }) => {
 				const unblocks = takeAwaited(current, message.replyTo, target.id, now);
-				const when = unblocks ? "it is blocked waiting for this reply and gets it right away" : expectation(target, delivery, now);
+				const when = unblocks ? "it is blocked waiting for this reply and gets it right away" : expectation(target, now);
 				return `Sent ${message.id} to ${targetLabel(target)}: ${when}.`;
 			});
 			const [first] = sent.value;
 			if (!first) throw new Error("nobody to send to");
 			if (sent.value.length > 1) {
-				const note = requestedWait > 0 ? '\nNot waiting on a fan-out: msg_wait from: "children" collects the replies.' : "";
+				const note = requestedWait > 0 ? "\nNot waiting on a group: their replies wake you." : "";
 				const details = { message: first.message, messages: sent.value.map((item) => item.message), to: params.to, recipients: sent.value.map((item) => item.target.id) };
 				return { content: toolText(`${lines.join("\n")}${note}`), details };
 			}
@@ -579,7 +520,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			onUpdate?.({ content: toolText(`${summary}\nWaiting up to ${waitSeconds}s for ${who} to reply…`), details: { message: first.message, to: first.target.id, live: true } });
 			const outcome = await current.waiters.wait(isReplyTo(first.message), waitSeconds * 1_000, signal);
 			return {
-				content: toolText(`${summary}\n${describeReply(outcome, who, waitSeconds)}`),
+				content: toolText(`${summary}\n${replyText(outcome, who, waitSeconds)}`),
 				details: {
 					message: first.message,
 					to: first.target.id,
@@ -588,61 +529,6 @@ export default function msgExtension(pi: ExtensionAPI): void {
 					outcome: outcome.kind,
 				},
 			};
-		},
-	});
-
-	/** What msg_wait's `from` means: anyone, any of your children, or one session. */
-	const waitFilter = (current: Live, from: string | undefined): Result<{ match: MessageMatch; who: string; id?: string }> => {
-		if (!from?.trim()) return ok({ match: isFrom(undefined), who: "anyone" });
-		if (isChildren(from)) {
-			const now = Date.now();
-			scan(current, now);
-			const count = liveChildren(root, current.id, now).length;
-			const who = `your children (${count === 0 ? "none" : count} live right now)`;
-			return ok({ match: isFromChildOf(current.id, (id) => readSafely(id)?.parent), who });
-		}
-		const sender = findRecipient(root, current.presence, from, Date.now());
-		if (!sender.ok) return fail(`${sender.error}. msg_list shows who's around`);
-		return ok({ match: isFrom(sender.value.id), who: targetLabel(sender.value), id: sender.value.id });
-	};
-
-	pi.registerTool({
-		name: "msg_wait",
-		label: "Wait for a message",
-		description: [
-			"Block until another agent session messages you, and get the message as this tool's result.",
-			'from: only wait for this sender: "parent", "children" (any child: its question, its final report when it ends, or a notice that it died), a folder, or a session id, name or id prefix. Other messages are delivered as usual meanwhile.',
-			`timeout_seconds: default ${DEFAULT_WAIT_SECONDS}, max ${MAX_WAIT_SECONDS}.`,
-			"Use it when your next step depends on another session: a go-ahead, a result, an answer, your children finishing. A headless `pi -p` run that ends its turn can't receive anything, so wait instead of finishing early.",
-		].join("\n"),
-		parameters: Type.Object({
-			from: Type.Optional(Type.String({ description: 'Only wait for messages from this sender ("parent", "children", a folder, an id or a name)' })),
-			timeout_seconds: Type.Optional(Type.Number({ description: `How long to wait (default ${DEFAULT_WAIT_SECONDS}, max ${MAX_WAIT_SECONDS})` })),
-		}),
-		async execute(_toolCallId, params, signal, onUpdate) {
-			const current = requireLive();
-			const timeoutSeconds = clampSeconds(params.timeout_seconds, DEFAULT_WAIT_SECONDS) || DEFAULT_WAIT_SECONDS;
-			const filter = waitFilter(current, params.from);
-			if (!filter.ok) throw new Error(filter.error);
-			const { match, who, id } = filter.value;
-			onUpdate?.({ content: toolText(`Waiting up to ${timeoutSeconds}s for a message from ${who}…`), details: { from: id ?? params.from } });
-			const waiting = current.waiters.wait(match, timeoutSeconds * 1_000, signal);
-			schedulePump(current);
-			const outcome = await waiting;
-			switch (outcome.kind) {
-				case "message": {
-					const now = Date.now();
-					rememberAwaited(current, outcome.message, now);
-					return {
-						content: toolText(renderForAgent(outcome.message, now, relationTo(current, outcome.message.from.id))),
-						details: { from: id ?? params.from, message: outcome.message, outcome: outcome.kind },
-					};
-				}
-				case "timeout":
-					return { content: toolText(`No message from ${who} within ${timeoutSeconds}s.`), details: { from: id ?? params.from, outcome: outcome.kind } };
-				case "aborted":
-					return { content: toolText("Stopped waiting."), details: { from: id ?? params.from, outcome: outcome.kind } };
-			}
 		},
 	});
 }

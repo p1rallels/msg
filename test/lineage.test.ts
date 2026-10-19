@@ -9,13 +9,16 @@ import {
 	hasFamily,
 	inheritedParent,
 	isNoticeOf,
-	LAST_WORDS_MAX,
 	lastWordsIn,
 	lifeOf,
+	nestedRefusal,
 	relationOf,
+	type RunState,
+	startAs,
+	wasStopped,
 	watchChildren,
 } from "../src/core/lineage.ts";
-import type { Life } from "../src/core/message.ts";
+import { createMessage, type Life, MAX_TEXT_BYTES, textBytes } from "../src/core/message.ts";
 import { type Presence, STALE_AFTER_MS } from "../src/core/registry.ts";
 import { message, presence } from "./helpers.ts";
 
@@ -35,7 +38,58 @@ describe("inheritedParent", () => {
 		expect(inheritedParent({ PI_SESSION_ID: "../etc" }, SELF, "print")).toBeUndefined();
 		expect(inheritedParent({ PI_SESSION_ID: SELF }, SELF, "print")).toBeUndefined();
 		expect(inheritedParent({ PI_SESSION_ID: PARENT }, SELF, "web")).toBeUndefined();
-		expect(inheritedParent({ PI_SESSION_ID: PARENT }, SELF, "cli")).toBeUndefined();
+	});
+});
+
+describe("no nested subs", () => {
+	const GRANDPARENT = "01a15000-0000-7000-8000-000000000000";
+	const records = new Map([
+		[PARENT, presence({ id: PARENT, name: "scout", parent: GRANDPARENT })],
+		[GRANDPARENT, presence({ id: GRANDPARENT, name: "lead" })],
+	]);
+	const recordOf = (id: string) => records.get(id);
+
+	test("a pi whose inherited parent is itself a sub is refused, naming that parent", () => {
+		const refusal = "nested subs aren't allowed: scout (01a152a0-f00d-72aa-a896-d904c458282b) is itself a sub. ask your parent instead.";
+		expect(nestedRefusal(records.get(PARENT))).toBe(refusal);
+		expect(startAs({ PI_SESSION_ID: PARENT }, SELF, "print", recordOf)).toEqual({ kind: "refuse", reason: refusal });
+		expect(startAs({ PI_SESSION_ID: PARENT }, SELF, "rpc", recordOf)).toEqual({ kind: "refuse", reason: refusal });
+		expect(startAs({ PI_SESSION_ID: PARENT }, SELF, "tui", recordOf).kind).toBe("refuse");
+	});
+
+	test("an unnamed sub parent is named by its id", () => {
+		expect(nestedRefusal(presence({ id: "p-1", parent: "g-1" }))).toBe("nested subs aren't allowed: p-1 is itself a sub. ask your parent instead.");
+	});
+
+	test("a top-level parent's sub runs, as its sub", () => {
+		expect(nestedRefusal(records.get(GRANDPARENT))).toBeUndefined();
+		expect(startAs({ PI_SESSION_ID: GRANDPARENT }, SELF, "print", recordOf)).toEqual({ kind: "run", parent: GRANDPARENT });
+	});
+
+	test("a parent with no record in this store (an isolated test store) isn't known to be a sub", () => {
+		expect(nestedRefusal(undefined)).toBeUndefined();
+		expect(startAs({ PI_SESSION_ID: "01a15999-0000-7000-8000-000000000000" }, SELF, "print", recordOf)).toEqual({
+			kind: "run",
+			parent: "01a15999-0000-7000-8000-000000000000",
+		});
+	});
+
+	test("no inherited parent, or hosted by pi-web: top-level, never refused", () => {
+		expect(startAs({}, SELF, "print", recordOf)).toEqual({ kind: "run" });
+		expect(startAs({ PI_SESSION_ID: PARENT }, SELF, "web", recordOf)).toEqual({ kind: "run" });
+		expect(startAs({ PI_SESSION_ID: SELF }, SELF, "print", recordOf)).toEqual({ kind: "run" });
+	});
+});
+
+describe("stopped", () => {
+	test("ending mid-run, or after an aborted last run, is stopped; a finished run, or none, isn't", () => {
+		const verdicts = (["none", "running", "finished", "aborted"] as const).map((run: RunState) => [run, wasStopped(run)]);
+		expect(verdicts).toEqual([
+			["none", false],
+			["running", true],
+			["finished", false],
+			["aborted", true],
+		]);
 	});
 });
 
@@ -186,31 +240,55 @@ describe("last words", () => {
 		expect(assistantWords(assistant([{ type: "thinking", thinking: "hmm" }, { type: "text", text: " done " }, { type: "text", text: "really" }]))).toBe(
 			"done \nreally",
 		);
-		expect(assistantWords(assistant([], { stopReason: "error", errorMessage: "overloaded" }))).toBe("(stopped with an error: overloaded)");
+		expect(assistantWords(assistant([], { stopReason: "error", errorMessage: "overloaded" }))).toBe("(failed with an error: overloaded)");
+		expect(assistantWords(assistant([], { stopReason: "aborted", errorMessage: "This operation was aborted" }))).toBeUndefined();
+		expect(assistantWords(assistant([{ type: "text", text: "Half a thou" }], { stopReason: "aborted" }))).toBe("Half a thou");
 		expect(assistantWords(assistant([{ type: "toolCall", name: "bash" }]))).toBeUndefined();
 		expect(assistantWords({ role: "user", content: [{ type: "text", text: "hi" }] })).toBeUndefined();
 		expect(assistantWords(null)).toBeUndefined();
 	});
 
-	test("lastWordsIn skips tool-only messages, users and custom entries", () => {
+	test("lastWordsIn skips tool-only messages, aborted empties, users and custom entries", () => {
 		const entries = [
 			entry(assistant([{ type: "text", text: "first" }])),
 			entry(assistant([{ type: "text", text: "the report" }])),
 			entry({ role: "user", content: [{ type: "text", text: "later user text" }] }),
 			entry(assistant([{ type: "toolCall", name: "msg_send" }])),
+			entry(assistant([], { stopReason: "aborted", errorMessage: "This operation was aborted" })),
 			{ type: "custom_message", customType: "msg", content: "x" },
 		];
 		expect(lastWordsIn(entries)).toBe("the report");
 		expect(lastWordsIn([])).toBeUndefined();
 	});
 
-	test("endedText keeps short words, cuts long ones at a word and points at the rest", () => {
+	test("endedText: the whole final message, however long, up to msg's message limit", () => {
 		expect(endedText("  all green  ", SELF)).toBe("all green");
 		expect(endedText(undefined, SELF)).toBe("(it ended without a final message)");
-		const long = `${"word ".repeat(200)}end`;
+		const report = `${"finding: the parser drops a trailing comma\n".repeat(150)}end of report`;
+		expect(report.length).toBeGreaterThan(6_000);
+		expect(endedText(report, SELF)).toBe(report);
+		const atLimit = "x".repeat(MAX_TEXT_BYTES);
+		expect(endedText(atLimit, SELF)).toBe(atLimit);
+	});
+
+	test("endedText: past the limit it's cut at a word, points at the rest, and still fits in a message", () => {
+		const long = `${"word ".repeat(MAX_TEXT_BYTES / 4)}end`;
 		const cut = endedText(long, SELF);
-		expect(cut.length).toBeLessThan(LAST_WORDS_MAX + 100);
+		expect(textBytes(cut)).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+		expect(textBytes(cut)).toBeGreaterThan(MAX_TEXT_BYTES - 200);
 		expect(cut).toMatch(/word… \[\+\d+ chars: lookup last 01a152d4-d2c3-751d-ab2f-1d14f1974871 -k assistant --full\]$/);
-		expect(endedText("x".repeat(LAST_WORDS_MAX + 50), SELF)).toStartWith(`${"x".repeat(LAST_WORDS_MAX)}…`);
+		const rest = Number(/\[\+(\d+) chars/.exec(cut)?.[1]);
+		expect(cut.indexOf("…") + rest).toBe(long.length);
+		expect(createMessage({ from: { id: SELF }, to: PARENT, text: cut, kind: "ended" }, 1).ok).toBe(true);
+	});
+
+	test("endedText: multibyte text is cut by bytes, never through a character", () => {
+		const emoji = "🚀".repeat(MAX_TEXT_BYTES / 2);
+		const cut = endedText(emoji, SELF);
+		expect(textBytes(cut)).toBeLessThanOrEqual(MAX_TEXT_BYTES);
+		expect(cut).not.toContain("\uFFFD");
+		const head = cut.slice(0, cut.indexOf("…"));
+		expect(head).toBe("🚀".repeat(head.length / 2));
+		expect(head.length).toBeGreaterThan(0);
 	});
 });

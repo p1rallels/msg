@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { deliver, pending } from "../src/core/maildir.ts";
 import type { Message } from "../src/core/message.ts";
-import { DEFAULT_WAKE_BUDGET, deliveryAction, recentWakes, wakeAllowed } from "../src/core/policy.ts";
+import { DEFAULT_WAKE_BUDGET, deliveryAction, outsideBudget, recentWakes, wakeAllowed } from "../src/core/policy.ts";
 import { pumpOnce } from "../src/core/pump.ts";
-import { createWaiters, isFrom, isFromChildOf, isReplyTo } from "../src/core/waiters.ts";
+import { createWaiters, isReplyTo } from "../src/core/waiters.ts";
 import { message, tempRoot } from "./helpers.ts";
 
 describe("waiters", () => {
@@ -52,47 +52,40 @@ describe("waiters", () => {
 		expect(match(message({ to: "alice", from: { id: "carol" }, replyTo: sent.id }))).toBe(false);
 	});
 
-	test("isReplyTo: a recipient that ends or dies instead of replying unblocks the sender too", () => {
+	test("isReplyTo: a recipient that ends, is stopped or dies instead of replying unblocks the sender too", () => {
 		const sent = message({ to: "kid", from: { id: "boss" } });
 		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "ended" }))).toBe(true);
+		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "ended", stopped: true }))).toBe(true);
 		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "died" }))).toBe(true);
-	});
-
-	test("isFromChildOf: whoever's record names me as parent when the message arrives", () => {
-		const parents: Record<string, string> = { "kid-1": "boss", "kid-2": "other" };
-		const match = isFromChildOf("boss", (id) => parents[id]);
-		expect(match(message({ to: "boss", from: { id: "kid-1" } }))).toBe(true);
-		expect(match(message({ to: "boss", from: { id: "kid-2" } }))).toBe(false);
-		expect(match(message({ to: "boss", from: { id: "stranger" } }))).toBe(false);
-		parents["late-kid"] = "boss";
-		expect(match(message({ to: "boss", from: { id: "late-kid" }, kind: "died" }))).toBe(true);
-	});
-
-	test("isFrom: anyone when unset", () => {
-		expect(isFrom(undefined)(message({ to: "x" }))).toBe(true);
-		expect(isFrom("sender-1")(message({ to: "x" }))).toBe(true);
-		expect(isFrom("other")(message({ to: "x" }))).toBe(false);
 	});
 });
 
 describe("deliveryAction", () => {
-	test("running sessions get it steered or queued, never woken", () => {
-		expect(deliveryAction({ mode: "print", idle: false, streaming: true, wakeAllowed: false }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: false });
-		expect(deliveryAction({ mode: "tui", idle: false, streaming: true, wakeAllowed: true }, "followUp")).toEqual({ kind: "inject", deliverAs: "followUp", wakes: false });
+	test("running sessions get it steered in at their next step, never woken", () => {
+		expect(deliveryAction({ mode: "print", idle: false, streaming: true, wakeAllowed: false })).toEqual({ kind: "inject", wakes: false });
+		expect(deliveryAction({ mode: "tui", idle: false, streaming: true, wakeAllowed: true })).toEqual({ kind: "inject", wakes: false });
 	});
 
 	test("busy but not streaming (compacting, run still starting) holds it for the next pump", () => {
-		expect(deliveryAction({ mode: "tui", idle: false, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
+		expect(deliveryAction({ mode: "tui", idle: false, streaming: false, wakeAllowed: true }).kind).toBe("hold");
 	});
 
 	test("idle print/json runs hold it; they'd break if a message started a run", () => {
-		expect(deliveryAction({ mode: "print", idle: true, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
-		expect(deliveryAction({ mode: "json", idle: true, streaming: false, wakeAllowed: true }, "steer").kind).toBe("hold");
+		expect(deliveryAction({ mode: "print", idle: true, streaming: false, wakeAllowed: true }).kind).toBe("hold");
+		expect(deliveryAction({ mode: "json", idle: true, streaming: false, wakeAllowed: true }).kind).toBe("hold");
 	});
 
 	test("idle interactive sessions wake, unless the wake budget is spent", () => {
-		expect(deliveryAction({ mode: "web", idle: true, streaming: false, wakeAllowed: true }, "steer")).toEqual({ kind: "inject", deliverAs: "steer", wakes: true });
-		expect(deliveryAction({ mode: "tui", idle: true, streaming: false, wakeAllowed: false }, "steer").kind).toBe("append");
+		expect(deliveryAction({ mode: "web", idle: true, streaming: false, wakeAllowed: true })).toEqual({ kind: "inject", wakes: true });
+		expect(deliveryAction({ mode: "tui", idle: true, streaming: false, wakeAllowed: false }).kind).toBe("append");
+	});
+
+	test("a sub's messages and exit notices are outside its parent's wake budget; a parent's or a peer's aren't", () => {
+		expect(outsideBudget(message({ to: "boss" }), "child")).toBe(true);
+		expect(outsideBudget(message({ to: "boss", kind: "ended" }), undefined)).toBe(true);
+		expect(outsideBudget(message({ to: "boss", kind: "died" }), "child")).toBe(true);
+		expect(outsideBudget(message({ to: "kid" }), "parent")).toBe(false);
+		expect(outsideBudget(message({ to: "peer" }), undefined)).toBe(false);
 	});
 
 	test("wake budget counts only wakes inside the window", () => {

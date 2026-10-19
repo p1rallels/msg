@@ -6,9 +6,7 @@ export const MESSAGE_VERSION = 1;
 export const MAX_TEXT_BYTES = 64 * 1024;
 export const MAX_NAME_LENGTH = 64;
 
-export type Delivery = "steer" | "followUp";
-
-/** Why a message exists beyond being said: a child session `ended` (text = its last words) or `died` (its process vanished). */
+/** Why a message exists beyond being said: a sub `ended` (text = its final message) or `died` (its process vanished). */
 export type Kind = "ended" | "died";
 
 export interface Sender {
@@ -23,6 +21,10 @@ export interface Life {
 	readonly startedAt: number;
 }
 
+/**
+ * Older messages may also carry `delivery` and `byUser` (from the `follow_up` option, `/msg` and the msg CLI, all
+ * cut): they still parse, and both are dropped.
+ */
 export interface Message {
 	readonly v: typeof MESSAGE_VERSION;
 	readonly id: string;
@@ -30,13 +32,12 @@ export interface Message {
 	readonly from: Sender;
 	readonly to: string;
 	readonly text: string;
-	readonly delivery: Delivery;
 	readonly replyTo?: string;
 	/** Epoch ms until which the sender is blocked waiting for a reply to this message. */
 	readonly awaitingUntil?: number;
 	readonly kind?: Kind;
-	/** A human typed it (`/msg`, or the msg CLI outside pi), not an agent. */
-	readonly byUser?: true;
+	/** Only on `ended`: the sub went away mid-run, or its last run was aborted, so `text` is its last message, not a finished report. */
+	readonly stopped?: true;
 	/** Which life of the sender a `died` notice is about, so a parent reports each death once. */
 	readonly life?: Life;
 }
@@ -45,11 +46,10 @@ export interface Draft {
 	readonly from: Sender;
 	readonly to: string;
 	readonly text: string;
-	readonly delivery?: Delivery;
 	readonly replyTo?: string;
 	readonly awaitingUntil?: number;
 	readonly kind?: Kind;
-	readonly byUser?: boolean;
+	readonly stopped?: boolean;
 	readonly life?: Life;
 }
 
@@ -60,8 +60,6 @@ const optionalString = (value: unknown): string | undefined => (typeof value ===
 
 const optionalNumber = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
-
-const isDelivery = (value: unknown): value is Delivery => value === "steer" || value === "followUp";
 
 const isKind = (value: unknown): value is Kind => value === "ended" || value === "died";
 
@@ -111,9 +109,9 @@ export const parseMessage = (value: unknown): Result<Message> => {
 	if (!to || !isValidId(to)) return fail("to: invalid");
 	const text = optionalString(value.text);
 	if (text === undefined) return fail("text: expected a string");
-	const delivery = isDelivery(value.delivery) ? value.delivery : "steer";
 	const replyTo = optionalString(value.replyTo);
 	const awaitingUntil = optionalNumber(value.awaitingUntil);
+	const kind = isKind(value.kind) ? value.kind : undefined;
 	const life = parseLife(value.life);
 	return ok({
 		v: MESSAGE_VERSION,
@@ -122,11 +120,10 @@ export const parseMessage = (value: unknown): Result<Message> => {
 		from: from.value,
 		to,
 		text,
-		delivery,
 		...(replyTo ? { replyTo } : {}),
 		...(awaitingUntil !== undefined ? { awaitingUntil } : {}),
-		...(isKind(value.kind) ? { kind: value.kind } : {}),
-		...(value.byUser === true ? { byUser: true as const } : {}),
+		...(kind ? { kind } : {}),
+		...(kind === "ended" && value.stopped === true ? { stopped: true as const } : {}),
 		...(life ? { life } : {}),
 	});
 };
@@ -145,17 +142,20 @@ export const createMessage = (draft: Draft, now: number, random: RandomHex = ran
 		from: { id: draft.from.id, ...(name ? { name } : {}), ...(draft.from.cwd ? { cwd: draft.from.cwd } : {}) },
 		to: draft.to,
 		text: text.value,
-		delivery: draft.delivery ?? "steer",
 		...(draft.replyTo ? { replyTo: draft.replyTo } : {}),
 		...(draft.awaitingUntil !== undefined ? { awaitingUntil: draft.awaitingUntil } : {}),
 		...(draft.kind ? { kind: draft.kind } : {}),
-		...(draft.byUser ? { byUser: true as const } : {}),
+		...(draft.kind === "ended" && draft.stopped ? { stopped: true as const } : {}),
 		...(draft.life ? { life: { pid: draft.life.pid, startedAt: draft.life.startedAt } } : {}),
 	});
 };
 
 export const partyLabel = (party: { readonly id: string; readonly name?: string | undefined }): string =>
 	party.name ?? party.id.slice(0, 8);
+
+/** `name (id)`, or the bare id: how an error names a session, so the next send can use its exact id. */
+export const exactLabel = (party: { readonly id: string; readonly name?: string | undefined }): string =>
+	party.name ? `${party.name} (${party.id})` : party.id;
 
 const escapeAttr = (value: string): string =>
 	value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -176,14 +176,13 @@ export const ago = (then: number, now: number): string => `${formatDuration(now 
 
 export const inFuture = (then: number, now: number): string => formatDuration(then - now);
 
-/** How the receiving session relates to the sender: its parent, its child, or neither. */
+/** How the receiving session relates to the sender: its parent, its sub (`child`), or neither. */
 export type Relation = "parent" | "child";
 
 const senderNote = (message: Message, relation: Relation | undefined): string => {
 	const who = partyLabel(message.from);
-	if (message.byUser) return `From your user via ${who}, not from an agent: treat it as your user's own instruction.`;
 	if (relation === "parent") return `From your parent session ${who} (an agent, not your user).`;
-	if (relation === "child") return `From your child session ${who} (an agent, not your user).`;
+	if (relation === "child") return `From your sub ${who} (an agent, not your user).`;
 	return "Message from another agent session (not your user).";
 };
 
@@ -193,19 +192,22 @@ const waitLeft = (message: Message, now: number): string | undefined =>
 const replyHint = (message: Message, now: number): string => {
 	const call = `msg_send to "${message.from.id}" with reply_to "${message.id}"`;
 	const left = waitLeft(message, now);
-	const waiter = message.byUser ? "Your user" : partyLabel(message.from);
-	if (left !== undefined) return `${waiter} is blocked waiting for your reply (${left} left): answer with ${call}.`;
-	if (message.byUser) return `If they want an answer, ${call}: it reaches them there.`;
+	if (left !== undefined) return `${partyLabel(message.from)} is blocked waiting for your reply (${left} left): answer with ${call}.`;
 	return `To answer, ${call}. Don't reply just to acknowledge.`;
 };
 
 const exitNote = (message: Message, kind: Kind, relation: Relation | undefined): string => {
-	const who = `${relation === "child" ? "Your child session" : "Session"} ${partyLabel(message.from)}`;
+	const who = `${relation === "child" ? "Your sub" : "Session"} ${partyLabel(message.from)}`;
+	const where = message.from.cwd ? ` in ${message.from.cwd}` : "";
+	const more = `\`lookup catchup ${message.from.id}\` shows its session.`;
 	switch (kind) {
 		case "ended":
-			return `${who} ended; above is its final message (its report). It can't answer until it's resumed.`;
+			if (message.stopped) {
+				return `${who} was stopped before it finished (it went away mid-run, or its last run was aborted): above is its last message, not a finished report. Inspect its work${where} before relying on it; ${more}`;
+			}
+			return `${who} ended; above is its final message, its report. It can't answer anymore; ${more}`;
 		case "died":
-			return `${who} died: its process is gone and it left no report. Check its work${message.from.cwd ? ` in ${message.from.cwd}` : ""} before relying on it.`;
+			return `${who} died: its process is gone and it left no report. Check its work${where} before relying on it.`;
 	}
 };
 
@@ -217,24 +219,11 @@ const attributes = (message: Message): string =>
 		...(message.from.cwd ? [`cwd="${escapeAttr(message.from.cwd)}"`] : []),
 		...(message.replyTo ? [`reply_to="${escapeAttr(message.replyTo)}"`] : []),
 		...(message.kind ? [`kind="${message.kind}"`] : []),
-		...(message.byUser ? ['sent_by="user"'] : []),
+		...(message.stopped ? ['stopped="true"'] : []),
 	].join(" ");
 
-/** What the receiving agent sees: the text, framed by who sent it (a peer, its parent or child, its user) and how to answer. */
+/** What the receiving agent sees: the text, framed by who sent it (a peer, its parent or its sub) and how to answer. */
 export const renderForAgent = (message: Message, now: number, relation?: Relation): string => {
 	const note = message.kind ? exitNote(message, message.kind, relation) : `${senderNote(message, relation)} ${replyHint(message, now)}`;
 	return [`<msg ${attributes(message)}>`, escapeBody(message.text), "</msg>", note].join("\n");
 };
-
-const clock = (ts: number): string => new Date(ts).toTimeString().slice(0, 8);
-
-const firstLine = (text: string, max: number): string => {
-	const line = text.split("\n").find((part) => part.trim()) ?? "";
-	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
-};
-
-const tag = (message: Message): string => (message.kind ? ` (${message.kind})` : message.byUser ? " (user)" : "");
-
-/** One-line human summary, e.g. `14:32:05 builder → main: tests pass`, `14:40:12 builder (ended) → main: done` */
-export const summarize = (message: Message, recipient: string, width = 100): string =>
-	`${clock(message.ts)} ${partyLabel(message.from)}${tag(message)} → ${recipient}: ${firstLine(message.text, width)}`;
