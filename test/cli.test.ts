@@ -224,7 +224,76 @@ describe("log", () => {
 		const log = harness();
 		await run(["log", "builder"], log.io);
 		expect(log.out.length).toBe(2);
-		expect(log.out[0]).toContain("main → builder: ping");
+		expect(log.out[0]).toContain("main (user) → builder: ping");
 		expect(log.out[1]).toContain("b-1 → you: pong  (unread)");
+	});
+});
+
+describe("lineage", () => {
+	const SESSION = "01a1-session";
+
+	test("ls inside a session that has family shows its parent and children; --json too", async () => {
+		peer(SESSION, "main", { mode: "web", parent: "boss-1" });
+		peer("boss-1", "boss", { mode: "rpc" });
+		peer("k-1", "kid", { mode: "print", activity: "busy", parent: SESSION });
+		peer("x-1", "stranger");
+		const h = harness({ PI_SESSION_ID: SESSION });
+		expect(await run(["ls"], h.io)).toBe(EXIT.ok);
+		const text = h.out.join("\n");
+		expect(text).toContain("parent: boss · boss-1 · rpc · idle");
+		expect(text).toContain("children: 1 (1 live)\n- kid · k-1 · print · busy");
+		expect(text).toContain("(1 other live session: all: true lists everyone)");
+		const json = harness({ PI_SESSION_ID: SESSION });
+		await run(["ls", "--json"], json.io);
+		const parsed = JSON.parse(json.out.join("\n")) as { parent: { id: string }; children: { id: string }[] };
+		expect([parsed.parent.id, parsed.children.map((child) => child.id)]).toEqual(["boss-1", ["k-1"]]);
+	});
+
+	test("outside pi a message is marked as the user's; inside pi it's the agent's", async () => {
+		peer("b-1", "builder");
+		await run(["send", "builder", "from a human"], harness().io);
+		await run(["send", "builder", "from an agent's bash"], harness({ PI_SESSION_ID: SESSION }).io);
+		const byUser = Object.fromEntries(peek(root, "b-1").map((entry) => (entry.kind === "message" ? [entry.message.text, entry.message.byUser === true] : ["?", "?"])));
+		expect(byUser).toEqual({ "from a human": true, "from an agent's bash": false });
+	});
+
+	test("send parent from a child's bash; send children fans out to the live ones", async () => {
+		peer(SESSION, "main", { mode: "print", activity: "busy", parent: "boss-1" });
+		peer("boss-1", "boss", { mode: "rpc" });
+		const up = harness({ PI_SESSION_ID: SESSION });
+		expect(await run(["send", "parent", "question"], up.io)).toBe(EXIT.ok);
+		expect(up.out[0]).toContain("to boss (boss-1)");
+		peer("k-1", "kid-a", { parent: "boss-1" });
+		peer("k-2", "kid-b", { parent: "boss-1", endedAt: START - 1 });
+		const down = harness({ MSG_ID: "boss-1" });
+		writePresence(root, presence({ id: "boss-1", name: "boss", mode: "cli", pid: process.pid, heartbeatAt: START }));
+		expect(await run(["send", "children", "freeze, main moved"], down.io)).toBe(EXIT.ok);
+		expect(down.out).toHaveLength(2);
+		expect(peek(root, "k-1").length).toBe(1);
+		expect(peek(root, "k-2").length).toBe(0);
+		expect(peek(root, SESSION).length).toBe(1);
+		const lonely = harness({ MSG_ID: "nobody" });
+		expect(await run(["send", "children", "hello?"], lonely.io)).toBe(EXIT.error);
+		expect(lonely.err[0]).toContain("has no live children");
+	});
+
+	test("wait --from children takes a child's message, even one that starts after the wait", async () => {
+		peer("x-1", "stranger");
+		deliver(root, reply("x-1", "boss-1", "not a child"));
+		const h = harness(
+			{ MSG_ID: "boss-1" },
+			{
+				onSleep: () => {
+					if (pending(root, "boss-1").length > 1) return;
+					peer("k-9", "late-kid", { parent: "boss-1" });
+					deliver(root, unwrap(createMessage({ from: { id: "k-9", name: "late-kid" }, to: "boss-1", text: "all done", kind: "ended" }, START + 2)));
+				},
+			},
+		);
+		expect(await run(["wait", "--from", "children", "--timeout", "5"], h.io)).toBe(EXIT.ok);
+		const text = h.out.join("\n");
+		expect(text).toContain("late-kid (k-9) · ended");
+		expect(text).toContain("all done");
+		expect(pending(root, "boss-1").length).toBe(1);
 	});
 });

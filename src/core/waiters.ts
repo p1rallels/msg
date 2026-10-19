@@ -73,3 +73,9 @@ export const isFrom =
 	(senderId: string | undefined): MessageMatch =>
 	(message) =>
 		senderId === undefined || message.from.id === senderId;
+
+/** From any session whose record names `parentId` as its parent, looked up when the message arrives. */
+export const isFromChildOf =
+	(parentId: string, parentOf: (id: string) => string | undefined): MessageMatch =>
+	(message) =>
+		parentOf(message.from.id) === parentId;

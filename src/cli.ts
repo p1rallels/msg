@@ -3,12 +3,15 @@ import { readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { parseArgs } from "node:util";
 import { expectation, formatDirectory, targetLabel } from "./core/format.ts";
+import { familyOf } from "./core/lineage.ts";
 import { allMessages, claim, peek } from "./core/maildir.ts";
 import { type Delivery, type Message, normalizeName, partyLabel, type Sender, summarize } from "./core/message.ts";
 import { type Env, isValidId, msgRoot } from "./core/paths.ts";
 import { directory, HEARTBEAT_EVERY_MS, isLive, listPresence, type Presence, readPresence, writePresence } from "./core/registry.ts";
-import { canAnswer, findRecipient, post } from "./core/send.ts";
-import { isFrom, isReplyTo, type MessageMatch } from "./core/waiters.ts";
+import { isChildren, type Target } from "./core/resolve.ts";
+import { fail, ok, type Result } from "./core/result.ts";
+import { canAnswer, findRecipient, liveChildren, post } from "./core/send.ts";
+import { isFrom, isFromChildOf, isReplyTo, type MessageMatch } from "./core/waiters.ts";
 
 export interface Io {
 	readonly env: Env;
@@ -30,15 +33,17 @@ const MAX_OFFLINE_LISTED = 25;
 const USAGE = `msg: talk to pi agent sessions on this machine
 
 usage:
-  msg ls [--all] [--json]                         who's around
+  msg ls [--all] [--json]                         you, your parent and children (--all: everyone)
   msg send <to> <text...|-> [--wait <secs>] [--reply-to <id>] [--follow-up]
   msg inbox [--peek] [--json]                     take the messages waiting for you
   msg wait [--from <who>] [--timeout <secs>]      block until a message arrives (exit 124 on timeout)
   msg log [<who>] [-n <count>]                    recent messages to and from you
   msg whoami
 
-<to>/<who>: a session name, full session id, or unique id prefix (see msg ls).
-<text> "-" reads the message from stdin.
+<to>/<who>: parent, children (send: every live child; wait: any child), a folder
+(/…, ~/…, ./…: the session working there), a session id, name or unique id prefix.
+<text> "-" reads the message from stdin. Outside pi (no $PI_SESSION_ID) a message
+is marked as sent by the user.
 
 identity (who you are when you send):
   --as <name>   your name; saved, peers address you by it (env MSG_NAME)
@@ -127,9 +132,11 @@ const whoAmI = (io: Io, flags: Flags): Me => {
 
 const sender = (me: Me): Sender => ({ id: me.id, ...(me.presence.name ? { name: me.presence.name } : {}), cwd: me.presence.cwd });
 
+const marks = (message: Message): string => [message.kind, message.byUser ? "from the user" : undefined].filter(Boolean).map((mark) => ` · ${mark}`).join("");
+
 const printMessage = (io: Io, message: Message): void => {
 	const reply = message.replyTo ? ` · re ${message.replyTo}` : "";
-	io.out(`── ${partyLabel(message.from)} (${message.from.id}) · ${message.id}${reply} · ${new Date(message.ts).toLocaleString()}`);
+	io.out(`── ${partyLabel(message.from)} (${message.from.id})${marks(message)} · ${message.id}${reply} · ${new Date(message.ts).toLocaleString()}`);
 	io.out(message.text);
 	if (message.awaitingUntil !== undefined && message.awaitingUntil > io.now()) {
 		io.out(`(waiting for your reply: msg send ${message.from.id} --reply-to ${message.id} "…")`);
@@ -169,13 +176,25 @@ const ownedNote = (me: Me): string =>
 const cmdLs = (io: Io, flags: Flags): number => {
 	const me = whoAmI(io, flags);
 	const now = io.now();
-	const dir = directory(listPresence(me.root), now);
+	const records = listPresence(me.root);
+	const dir = directory(records, now);
 	if (flags.json) {
-		io.out(JSON.stringify({ you: me.presence, live: dir.live, offline: dir.offline }, null, 2));
+		const family = familyOf(records, me.presence);
+		io.out(JSON.stringify({ you: me.presence, parent: family.parent ?? family.parentId, children: family.children, live: dir.live, offline: dir.offline }, null, 2));
 		return EXIT.ok;
 	}
 	io.out(formatDirectory(dir, me.presence, now, homedir(), { all: flags.all === true, maxOffline: MAX_OFFLINE_LISTED }));
 	return EXIT.ok;
+};
+
+/** One session, or every live child for `children`. */
+const recipientsOf = (io: Io, me: Me, to: string): Result<Target[]> => {
+	if (!isChildren(to)) {
+		const found = findRecipient(me.root, me.presence, to, io.now());
+		return found.ok ? ok([found.value]) : found;
+	}
+	const children = liveChildren(me.root, me.id, io.now());
+	return children.length > 0 ? ok(children) : fail(`${partyLabel(me.presence)} has no live children`);
 };
 
 const cmdSend = async (io: Io, flags: Flags, args: readonly string[]): Promise<number> => {
@@ -184,32 +203,34 @@ const cmdSend = async (io: Io, flags: Flags, args: readonly string[]): Promise<n
 	const text = words.length === 1 && words[0] === "-" ? io.stdin() : words.join(" ");
 	const waitSeconds = seconds(flags.wait, "wait", 0);
 	const delivery: Delivery = flags["follow-up"] ? "followUp" : "steer";
+	const byUser = !io.env.PI_SESSION_ID?.trim();
 	const me = whoAmI(io, flags);
 	const now = io.now();
-	const found = findRecipient(me.root, sender(me), to, now);
+	const found = recipientsOf(io, me, to);
 	if (!found.ok) {
 		io.err(`msg: ${found.error}; \`msg ls\` shows who's around`);
 		return EXIT.error;
 	}
-	const target = found.value;
-	const willWait = waitSeconds > 0 && canAnswer(target);
+	const targets = found.value;
+	const [single] = targets;
+	const willWait = waitSeconds > 0 && targets.length === 1 && single !== undefined && canAnswer(single);
 	const replyTo = flags["reply-to"]?.trim();
-	const posted = post(
-		me.root,
-		sender(me),
-		target,
-		{ text, delivery, ...(replyTo ? { replyTo } : {}), ...(willWait ? { awaitingUntil: now + waitSeconds * 1_000 } : {}) },
-		now,
-	);
-	if (!posted.ok) {
-		io.err(`msg: ${posted.error}`);
-		return EXIT.error;
+	const outgoing = { text, delivery, byUser, ...(replyTo ? { replyTo } : {}), ...(willWait ? { awaitingUntil: now + waitSeconds * 1_000 } : {}) };
+	const sent: Message[] = [];
+	for (const target of targets) {
+		const posted = post(me.root, sender(me), target, outgoing, now);
+		if (!posted.ok) {
+			io.err(`msg: ${posted.error}`);
+			return EXIT.error;
+		}
+		sent.push(posted.value);
+		io.out(`sent ${posted.value.id} to ${targetLabel(target)}: ${expectation(target, delivery, now)}`);
 	}
-	io.out(`sent ${posted.value.id} to ${targetLabel(target)}: ${expectation(target, delivery, now)}`);
-	if (waitSeconds > 0 && !willWait) io.out("not waiting: nobody there can answer right now");
-	if (!willWait) return EXIT.ok;
+	if (waitSeconds > 0 && !willWait) io.out(targets.length > 1 ? "not waiting on a fan-out: `msg wait --from children` collects replies" : "not waiting: nobody there can answer right now");
+	const [first] = sent;
+	if (!willWait || !first) return EXIT.ok;
 	if (me.ownedBySession) io.err(ownedNote(me));
-	const reply = await waitFor(io, me, isReplyTo(posted.value), waitSeconds * 1_000);
+	const reply = await waitFor(io, me, isReplyTo(first), waitSeconds * 1_000);
 	if (!reply) {
 		io.out(`no reply within ${waitSeconds}s (a later one waits in \`msg inbox\`)`);
 		return EXIT.timeout;
@@ -240,16 +261,24 @@ const cmdInbox = (io: Io, flags: Flags): number => {
 	return EXIT.ok;
 };
 
+/** Anyone, any child of yours (looked up as messages arrive), or one session. */
+const waitMatch = (io: Io, me: Me, from: string | undefined): Result<MessageMatch> => {
+	if (!from?.trim()) return ok(isFrom(undefined));
+	if (isChildren(from)) return ok(isFromChildOf(me.id, (id) => readPresence(me.root, id)?.parent));
+	const found = findRecipient(me.root, me.presence, from, io.now());
+	return found.ok ? ok(isFrom(found.value.id)) : found;
+};
+
 const cmdWait = async (io: Io, flags: Flags): Promise<number> => {
 	const timeoutSeconds = seconds(flags.timeout, "timeout", 300);
 	const me = whoAmI(io, flags);
 	if (me.ownedBySession) io.err(ownedNote(me));
-	const from = flags.from?.trim() ? findRecipient(me.root, sender(me), flags.from, io.now()) : undefined;
-	if (from && !from.ok) {
-		io.err(`msg: ${from.error}`);
+	const match = waitMatch(io, me, flags.from);
+	if (!match.ok) {
+		io.err(`msg: ${match.error}`);
 		return EXIT.error;
 	}
-	const message = await waitFor(io, me, isFrom(from?.ok ? from.value.presence.id : undefined), timeoutSeconds * 1_000);
+	const message = await waitFor(io, me, match.value, timeoutSeconds * 1_000);
 	if (!message) {
 		io.out(`no message within ${timeoutSeconds}s`);
 		return EXIT.timeout;
@@ -262,12 +291,12 @@ const cmdLog = (io: Io, flags: Flags, args: readonly string[]): number => {
 	const me = whoAmI(io, flags);
 	const limit = count(flags.n, 20);
 	const [who] = args;
-	const peer = who ? findRecipient(me.root, sender(me), who, io.now()) : undefined;
+	const peer = who ? findRecipient(me.root, me.presence, who, io.now()) : undefined;
 	if (peer && !peer.ok) {
 		io.err(`msg: ${peer.error}`);
 		return EXIT.error;
 	}
-	const peerId = peer?.ok ? peer.value.presence.id : undefined;
+	const peerId = peer?.ok ? peer.value.id : undefined;
 	const names = new Map(listPresence(me.root).map((record) => [record.id, partyLabel(record)]));
 	const mine = allMessages(me.root)
 		.filter(({ message }) => message.from.id === me.id || message.to === me.id)

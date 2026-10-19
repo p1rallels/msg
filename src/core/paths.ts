@@ -1,5 +1,6 @@
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
@@ -31,6 +32,15 @@ export const agentDir = (env: Env, home: string = homedir()): string => {
 export const msgRoot = (env: Env, home: string = homedir()): string => {
 	const configured = nonEmpty(env.PI_MSG_DIR);
 	return configured ? expandHome(configured, home) : join(agentDir(env, home), "msg");
+};
+
+/** The folder with symlinks resolved, or just normalized when it doesn't exist. */
+export const canonicalPath = (path: string): string => {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
 };
 
 export const sessionsDir = (root: string): string => join(root, "sessions");

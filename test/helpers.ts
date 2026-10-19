@@ -23,6 +23,8 @@ export const message = (draft: Partial<Draft> & { to: string }, now = 1_700_000_
 				...(draft.delivery ? { delivery: draft.delivery } : {}),
 				...(draft.replyTo ? { replyTo: draft.replyTo } : {}),
 				...(draft.awaitingUntil !== undefined ? { awaitingUntil: draft.awaitingUntil } : {}),
+				...(draft.kind ? { kind: draft.kind } : {}),
+				...(draft.byUser ? { byUser: true } : {}),
 			},
 			now,
 			fixedRandom,

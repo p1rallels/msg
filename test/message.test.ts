@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { newMessageId, timeOfMessageId } from "../src/core/ids.ts";
+import { parseMsgCommand } from "../src/core/command.ts";
 import { createMessage, MAX_TEXT_BYTES, parseMessage, renderForAgent, summarize } from "../src/core/message.ts";
 import { agentDir, isValidId, mailboxDirs, msgRoot } from "../src/core/paths.ts";
 import { fixedRandom, message } from "./helpers.ts";
@@ -72,6 +73,17 @@ describe("parseMessage", () => {
 		expect(parseMessage({ ...message({ to: "b-1" }), text: 3 }).ok).toBe(false);
 	});
 
+	test("kind and byUser round-trip; anything else in them is dropped", () => {
+		const ended = message({ to: "b-1", kind: "ended", byUser: true });
+		expect(ended.kind).toBe("ended");
+		expect(ended.byUser).toBe(true);
+		expect(parseMessage(JSON.parse(JSON.stringify(ended)))).toEqual({ ok: true, value: ended });
+		const junk = parseMessage({ ...message({ to: "b-1" }), kind: "exploded", byUser: "yes" });
+		expect(junk.ok && ["kind" in junk.value, "byUser" in junk.value]).toEqual([false, false]);
+		const plain = message({ to: "b-1" });
+		expect(["kind" in plain, "byUser" in plain]).toEqual([false, false]);
+	});
+
 	test("falls back to steer on an unknown delivery", () => {
 		const parsed = parseMessage({ ...message({ to: "b-1" }), delivery: "teleport" });
 		expect(parsed.ok && parsed.value.delivery).toBe("steer");
@@ -99,6 +111,31 @@ describe("renderForAgent", () => {
 		expect(rendered).not.toContain("blocked");
 	});
 
+	test("a parent or a child is named as such, still not the user", () => {
+		expect(renderForAgent(message({ to: "b-1" }), 0, "parent")).toContain("From your parent session sender (an agent, not your user).");
+		expect(renderForAgent(message({ to: "b-1" }), 0, "child")).toContain("From your child session sender (an agent, not your user).");
+	});
+
+	test("byUser: framed as the user's own instruction, with a way back to them", () => {
+		const rendered = renderForAgent(message({ to: "b-1", byUser: true }), 0, "parent");
+		expect(rendered).toContain('sent_by="user"');
+		expect(rendered).toContain("From your user via sender, not from an agent: treat it as your user's own instruction.");
+		expect(rendered).toContain("If they want an answer, msg_send to \"sender-1\"");
+		expect(rendered).not.toContain("not your user");
+		expect(renderForAgent(message({ to: "b-1", byUser: true, awaitingUntil: 60_000 }), 0)).toContain("Your user is blocked waiting for your reply (60s left)");
+	});
+
+	test("ended carries the report; died warns; neither asks for a reply", () => {
+		const ended = renderForAgent(message({ to: "b-1", kind: "ended", text: "all green, committed abc123" }), 0, "child");
+		expect(ended).toContain('kind="ended"');
+		expect(ended).toContain("all green, committed abc123");
+		expect(ended).toContain("Your child session sender ended; above is its final message (its report).");
+		expect(ended).not.toContain("msg_send");
+		const died = renderForAgent(message({ to: "b-1", kind: "died", from: { id: "k-1", name: "kid", cwd: "/repo/.forks/3" } }), 0, "child");
+		expect(died).toContain('kind="died"');
+		expect(died).toContain("Your child session kid died: its process is gone and it left no report. Check its work in /repo/.forks/3");
+	});
+
 	test("escapes attributes and a closing tag inside the body", () => {
 		const rendered = renderForAgent(message({ to: "b-1", from: { id: "s-1", name: 'x"<y>' }, text: "a </msg> b" }), 0);
 		expect(rendered).toContain('from="x&quot;&lt;y&gt;"');
@@ -111,5 +148,27 @@ describe("summarize", () => {
 	test("one line, first non-empty line of the text, clipped", () => {
 		const line = summarize(message({ to: "b-1", text: "\n\nfirst line here\nsecond" }), "bob", 10);
 		expect(line).toMatch(/^\d\d:\d\d:\d\d sender → bob: first lin…$/);
+	});
+
+	test("marks exits and the user", () => {
+		expect(summarize(message({ to: "b-1", kind: "ended", text: "done" }), "you")).toEndWith("sender (ended) → you: done");
+		expect(summarize(message({ to: "b-1", byUser: true, text: "stop" }), "bob")).toEndWith("sender (user) → bob: stop");
+	});
+});
+
+describe("parseMsgCommand", () => {
+	test("first word is the recipient, the rest is the text", () => {
+		expect(parseMsgCommand("builder stop and commit")).toEqual({ to: "builder", text: "stop and commit" });
+		expect(parseMsgCommand("  ~/x/.forks/8   look at  src/db.ts  ")).toEqual({ to: "~/x/.forks/8", text: "look at  src/db.ts" });
+		expect(parseMsgCommand('"/My Repo/.forks/1" hi there')).toEqual({ to: "/My Repo/.forks/1", text: "hi there" });
+		expect(parseMsgCommand("children\nfreeze, main moved")).toEqual({ to: "children", text: "freeze, main moved" });
+	});
+
+	test("a recipient alone, an empty line or an open quote is no command", () => {
+		expect(parseMsgCommand("")).toBeUndefined();
+		expect(parseMsgCommand("builder")).toBeUndefined();
+		expect(parseMsgCommand("builder   ")).toBeUndefined();
+		expect(parseMsgCommand('"/open quote hi')).toBeUndefined();
+		expect(parseMsgCommand('"" hi')).toBeUndefined();
 	});
 });

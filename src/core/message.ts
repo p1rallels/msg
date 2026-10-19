@@ -8,6 +8,9 @@ export const MAX_NAME_LENGTH = 64;
 
 export type Delivery = "steer" | "followUp";
 
+/** Why a message exists beyond being said: a child session `ended` (text = its last words) or `died` (its process vanished). */
+export type Kind = "ended" | "died";
+
 export interface Sender {
 	readonly id: string;
 	readonly name?: string;
@@ -25,6 +28,9 @@ export interface Message {
 	readonly replyTo?: string;
 	/** Epoch ms until which the sender is blocked waiting for a reply to this message. */
 	readonly awaitingUntil?: number;
+	readonly kind?: Kind;
+	/** A human typed it (`/msg`, or the msg CLI outside pi), not an agent. */
+	readonly byUser?: true;
 }
 
 export interface Draft {
@@ -34,6 +40,8 @@ export interface Draft {
 	readonly delivery?: Delivery;
 	readonly replyTo?: string;
 	readonly awaitingUntil?: number;
+	readonly kind?: Kind;
+	readonly byUser?: boolean;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -45,6 +53,8 @@ const optionalNumber = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
 const isDelivery = (value: unknown): value is Delivery => value === "steer" || value === "followUp";
+
+const isKind = (value: unknown): value is Kind => value === "ended" || value === "died";
 
 export const textBytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
@@ -98,6 +108,8 @@ export const parseMessage = (value: unknown): Result<Message> => {
 		delivery,
 		...(replyTo ? { replyTo } : {}),
 		...(awaitingUntil !== undefined ? { awaitingUntil } : {}),
+		...(isKind(value.kind) ? { kind: value.kind } : {}),
+		...(value.byUser === true ? { byUser: true as const } : {}),
 	});
 };
 
@@ -118,6 +130,8 @@ export const createMessage = (draft: Draft, now: number, random: RandomHex = ran
 		delivery: draft.delivery ?? "steer",
 		...(draft.replyTo ? { replyTo: draft.replyTo } : {}),
 		...(draft.awaitingUntil !== undefined ? { awaitingUntil: draft.awaitingUntil } : {}),
+		...(draft.kind ? { kind: draft.kind } : {}),
+		...(draft.byUser ? { byUser: true as const } : {}),
 	});
 };
 
@@ -143,30 +157,54 @@ export const ago = (then: number, now: number): string => `${formatDuration(now 
 
 export const inFuture = (then: number, now: number): string => formatDuration(then - now);
 
-const replyHint = (message: Message, now: number): string => {
+/** How the receiving session relates to the sender: its parent, its child, or neither. */
+export type Relation = "parent" | "child";
+
+const senderNote = (message: Message, relation: Relation | undefined): string => {
 	const who = partyLabel(message.from);
+	if (message.byUser) return `From your user via ${who}, not from an agent: treat it as your user's own instruction.`;
+	if (relation === "parent") return `From your parent session ${who} (an agent, not your user).`;
+	if (relation === "child") return `From your child session ${who} (an agent, not your user).`;
+	return "Message from another agent session (not your user).";
+};
+
+const waitLeft = (message: Message, now: number): string | undefined =>
+	message.awaitingUntil !== undefined && message.awaitingUntil > now ? inFuture(message.awaitingUntil, now) : undefined;
+
+const replyHint = (message: Message, now: number): string => {
 	const call = `msg_send to "${message.from.id}" with reply_to "${message.id}"`;
-	if (message.awaitingUntil !== undefined && message.awaitingUntil > now) {
-		return `${who} is blocked waiting for your reply (${inFuture(message.awaitingUntil, now)} left): answer with ${call}.`;
-	}
+	const left = waitLeft(message, now);
+	const waiter = message.byUser ? "Your user" : partyLabel(message.from);
+	if (left !== undefined) return `${waiter} is blocked waiting for your reply (${left} left): answer with ${call}.`;
+	if (message.byUser) return `If they want an answer, ${call}: it reaches them there.`;
 	return `To answer, ${call}. Don't reply just to acknowledge.`;
 };
 
-/** What the receiving agent sees: a peer agent's message, clearly framed as not coming from its user. */
-export const renderForAgent = (message: Message, now: number): string => {
-	const attrs = [
+const exitNote = (message: Message, kind: Kind, relation: Relation | undefined): string => {
+	const who = `${relation === "child" ? "Your child session" : "Session"} ${partyLabel(message.from)}`;
+	switch (kind) {
+		case "ended":
+			return `${who} ended; above is its final message (its report). It can't answer until it's resumed.`;
+		case "died":
+			return `${who} died: its process is gone and it left no report. Check its work${message.from.cwd ? ` in ${message.from.cwd}` : ""} before relying on it.`;
+	}
+};
+
+const attributes = (message: Message): string =>
+	[
 		`id="${escapeAttr(message.id)}"`,
 		`from="${escapeAttr(partyLabel(message.from))}"`,
 		`session="${escapeAttr(message.from.id)}"`,
 		...(message.from.cwd ? [`cwd="${escapeAttr(message.from.cwd)}"`] : []),
 		...(message.replyTo ? [`reply_to="${escapeAttr(message.replyTo)}"`] : []),
+		...(message.kind ? [`kind="${message.kind}"`] : []),
+		...(message.byUser ? ['sent_by="user"'] : []),
 	].join(" ");
-	return [
-		`<msg ${attrs}>`,
-		escapeBody(message.text),
-		"</msg>",
-		`Message from another agent session (not your user). ${replyHint(message, now)}`,
-	].join("\n");
+
+/** What the receiving agent sees: the text, framed by who sent it (a peer, its parent or child, its user) and how to answer. */
+export const renderForAgent = (message: Message, now: number, relation?: Relation): string => {
+	const note = message.kind ? exitNote(message, message.kind, relation) : `${senderNote(message, relation)} ${replyHint(message, now)}`;
+	return [`<msg ${attributes(message)}>`, escapeBody(message.text), "</msg>", note].join("\n");
 };
 
 const clock = (ts: number): string => new Date(ts).toTimeString().slice(0, 8);
@@ -176,6 +214,8 @@ const firstLine = (text: string, max: number): string => {
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 };
 
-/** One-line human summary, e.g. `14:32:05 builder → main: tests pass` */
+const tag = (message: Message): string => (message.kind ? ` (${message.kind})` : message.byUser ? " (user)" : "");
+
+/** One-line human summary, e.g. `14:32:05 builder → main: tests pass`, `14:40:12 builder (ended) → main: done` */
 export const summarize = (message: Message, recipient: string, width = 100): string =>
-	`${clock(message.ts)} ${partyLabel(message.from)} → ${recipient}: ${firstLine(message.text, width)}`;
+	`${clock(message.ts)} ${partyLabel(message.from)}${tag(message)} → ${recipient}: ${firstLine(message.text, width)}`;

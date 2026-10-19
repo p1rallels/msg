@@ -103,8 +103,8 @@ describe("resolveTarget", () => {
 	);
 
 	const resolved = (query: string) => {
-		const result = resolveTarget(query, dir);
-		return result.ok ? `${result.value.presence.id}:${result.value.live ? "live" : "offline"}:${result.value.via}` : `error:${result.error}`;
+		const result = resolveTarget(query, dir, { id: "asker" }, { home: "/home/u" });
+		return result.ok ? `${result.value.id}:${result.value.live ? "live" : "offline"}:${result.value.via}` : `error:${result.error}`;
 	};
 
 	test("exact id first", () => {
@@ -136,5 +136,97 @@ describe("resolveTarget", () => {
 		expect(message).toContain('no session matches "ghost"');
 		expect(message).toContain("main (01a13e22-aaaa)");
 		expect(resolved("  ")).toBe("error:recipient is empty");
+	});
+});
+
+describe("presence parent", () => {
+	test("kept when it's a valid id other than the session's own", () => {
+		const parsed = (parent: unknown) => {
+			const result = parsePresence({ ...presence({ id: "s-1" }), parent });
+			return result.ok ? result.value.parent : "invalid";
+		};
+		expect(parsed("p-1")).toBe("p-1");
+		expect(parsed("s-1")).toBeUndefined();
+		expect(parsed("../x")).toBeUndefined();
+		expect(parsed(42)).toBeUndefined();
+		expect(parsed(undefined)).toBeUndefined();
+	});
+});
+
+describe("resolveTarget: parent, folders, family first", () => {
+	const now = 1_000_000;
+	const records = [
+		presence({ id: "boss-1", name: "boss", cwd: "/repo", heartbeatAt: now }),
+		presence({ id: "kid-1", name: "builder", parent: "me", cwd: "/repo/.forks/1", heartbeatAt: now }),
+		presence({ id: "kid-2", name: "kid", parent: "me", cwd: "/repo/.forks/2", heartbeatAt: 10, endedAt: 10 }),
+		presence({ id: "far-1", name: "builder", cwd: "/elsewhere", heartbeatAt: now }),
+		presence({ id: "far-2", name: "lonely", cwd: "/elsewhere", heartbeatAt: now }),
+		presence({ id: "twin-a", name: "twin", parent: "me", cwd: "/twins", heartbeatAt: now }),
+		presence({ id: "twin-b", name: "twin", parent: "me", cwd: "/twins", heartbeatAt: now }),
+		presence({ id: "old-1", name: "gone", cwd: "/old", heartbeatAt: 50, endedAt: 50 }),
+		presence({ id: "old-2", name: "gone", cwd: "/old", heartbeatAt: 70, endedAt: 70 }),
+	];
+	const dir = directory(records, now, alive);
+	const me = { id: "me", parent: "boss-1", cwd: "/repo/.forks" };
+	const resolved = (query: string, asker: Parameters<typeof resolveTarget>[2] = me, canonical?: (path: string) => string) => {
+		const result = resolveTarget(query, dir, asker, { home: "/home/u", ...(canonical ? { canonical } : {}) });
+		return result.ok ? `${result.value.id}:${result.value.live ? "live" : "offline"}:${result.value.via}` : `error:${result.error}`;
+	};
+
+	test("parent resolves to your parent, recorded or not", () => {
+		expect(resolved("parent")).toBe("boss-1:live:parent");
+		expect(resolved("@Parent")).toBe("boss-1:live:parent");
+		expect(resolved("parent", { id: "me", parent: "nobody-1" })).toBe("nobody-1:offline:parent");
+		expect(resolved("nobody-1", { id: "me", parent: "nobody-1" })).toBe("nobody-1:offline:parent");
+		expect(resolved("parent", { id: "me" })).toContain("error:you have no parent session");
+	});
+
+	test("exact id beats the parent keyword's neighbours; children is a group, not a session", () => {
+		expect(resolved("kid-1")).toBe("kid-1:live:id");
+		expect(resolved("children")).toContain('error:"children" names a group');
+	});
+
+	test("a folder finds the live session working there", () => {
+		expect(resolved("/repo/.forks/1")).toBe("kid-1:live:folder");
+		expect(resolved("/repo/.forks/1/")).toBe("kid-1:live:folder");
+		expect(resolved("./1")).toBe("kid-1:live:folder");
+		expect(resolved("../../repo/.forks/1", { id: "me", cwd: "/elsewhere/x" })).toBe("kid-1:live:folder");
+		expect(resolved("..")).toBe("boss-1:live:folder");
+	});
+
+	test("~ is home; symlinked spellings meet through canonical", () => {
+		const homeDir = directory([presence({ id: "h-1", cwd: "/home/u/proj", heartbeatAt: now })], now, alive);
+		const result = resolveTarget("~/proj", homeDir, me, { home: "/home/u" });
+		expect(result.ok && result.value.id).toBe("h-1");
+		const canonical = (path: string) => path.replace(/^\/tmp\b/, "/private/tmp");
+		const tmpDir = directory([presence({ id: "t-1", cwd: "/private/tmp/w", heartbeatAt: now })], now, alive);
+		const viaLink = resolveTarget("/tmp/w", tmpDir, me, { home: "/home/u", canonical });
+		expect(viaLink.ok && viaLink.value.id).toBe("t-1");
+	});
+
+	test("several live sessions in one folder is ambiguous and lists them", () => {
+		expect(resolved("/twins")).toContain("error:2 live sessions work in /twins");
+		expect(resolved("/twins")).toContain("twin-a");
+		expect(resolved("/elsewhere")).toContain("error:2 live sessions work in /elsewhere");
+	});
+
+	test("a folder with nobody live falls back to the last session seen there, else fails", () => {
+		expect(resolved("/old")).toBe("old-2:offline:folder");
+		expect(resolved("/repo/.forks/2")).toBe("kid-2:offline:folder");
+		expect(resolved("/nowhere")).toBe("error:no session works in /nowhere");
+	});
+
+	test("a live name prefers your family, then anyone", () => {
+		expect(resolved("builder")).toBe("kid-1:live:name");
+		expect(resolved("builder", { id: "stranger" })).toContain('error:name "builder" is ambiguous');
+		expect(resolved("lonely")).toBe("far-2:live:name");
+		expect(resolved("boss")).toBe("boss-1:live:name");
+		expect(resolved("twin")).toContain('error:name "twin" is ambiguous');
+	});
+
+	test("prefix, then the most recently seen offline name", () => {
+		expect(resolved("far-")).toContain('error:id prefix "far-" is ambiguous');
+		expect(resolved("boss-")).toBe("boss-1:live:prefix");
+		expect(resolved("gone")).toBe("old-2:offline:name");
 	});
 });

@@ -3,7 +3,7 @@ import { deliver, pending } from "../src/core/maildir.ts";
 import type { Message } from "../src/core/message.ts";
 import { DEFAULT_WAKE_BUDGET, deliveryAction, recentWakes, wakeAllowed } from "../src/core/policy.ts";
 import { pumpOnce } from "../src/core/pump.ts";
-import { createWaiters, isFrom, isReplyTo } from "../src/core/waiters.ts";
+import { createWaiters, isFrom, isFromChildOf, isReplyTo } from "../src/core/waiters.ts";
 import { message, tempRoot } from "./helpers.ts";
 
 describe("waiters", () => {
@@ -50,6 +50,22 @@ describe("waiters", () => {
 		expect(match(message({ to: "alice", from: { id: "bob" } }))).toBe(true);
 		expect(match(message({ to: "alice", from: { id: "bob" }, replyTo: "000000000-other0" }))).toBe(false);
 		expect(match(message({ to: "alice", from: { id: "carol" }, replyTo: sent.id }))).toBe(false);
+	});
+
+	test("isReplyTo: a recipient that ends or dies instead of replying unblocks the sender too", () => {
+		const sent = message({ to: "kid", from: { id: "boss" } });
+		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "ended" }))).toBe(true);
+		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "died" }))).toBe(true);
+	});
+
+	test("isFromChildOf: whoever's record names me as parent when the message arrives", () => {
+		const parents: Record<string, string> = { "kid-1": "boss", "kid-2": "other" };
+		const match = isFromChildOf("boss", (id) => parents[id]);
+		expect(match(message({ to: "boss", from: { id: "kid-1" } }))).toBe(true);
+		expect(match(message({ to: "boss", from: { id: "kid-2" } }))).toBe(false);
+		expect(match(message({ to: "boss", from: { id: "stranger" } }))).toBe(false);
+		parents["late-kid"] = "boss";
+		expect(match(message({ to: "boss", from: { id: "late-kid" }, kind: "died" }))).toBe(true);
 	});
 
 	test("isFrom: anyone when unset", () => {

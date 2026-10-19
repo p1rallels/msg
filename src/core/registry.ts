@@ -18,6 +18,8 @@ export interface Presence {
 	readonly v: typeof PRESENCE_VERSION;
 	readonly id: string;
 	readonly name?: string;
+	/** The session whose bash started this one (lineage). Its children are the records naming it here. */
+	readonly parent?: string;
 	readonly cwd: string;
 	readonly pid: number;
 	readonly mode: Mode;
@@ -48,11 +50,13 @@ export const parsePresence = (value: unknown): Result<Presence> => {
 	const mode = MODES.find((candidate) => candidate === value.mode) ?? "rpc";
 	const activity: Activity = value.activity === "busy" ? "busy" : "idle";
 	const name = normalizeName(typeof value.name === "string" ? value.name : undefined);
+	const parent = typeof value.parent === "string" && isValidId(value.parent) && value.parent !== id ? value.parent : undefined;
 	const endedAt = finite(value.endedAt);
 	return ok({
 		v: PRESENCE_VERSION,
 		id,
 		...(name ? { name } : {}),
+		...(parent ? { parent } : {}),
 		cwd,
 		pid,
 		mode,
