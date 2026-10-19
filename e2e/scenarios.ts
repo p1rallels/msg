@@ -230,6 +230,7 @@ const REPORT = [
 ].join("\n");
 
 const SLEEPER_TASK = "Run the bash command `sleep 90` and wait for it to finish. Then reply DONE.";
+const SAY_THEN_SLEEP = `First say, in one short sentence, what you're about to do. Then: ${SLEEPER_TASK}`;
 
 const isEnded = (message: Message, from: string): boolean => message.kind === "ended" && message.from.id === from;
 
@@ -406,8 +407,9 @@ export const nested = async (): Promise<boolean> => {
 };
 
 /**
- * A sub that goes away mid-run (SIGTERM, what pi-web's Esc sends a sub) and an rpc sub whose last run was
- * aborted both report `stopped`; a sub that finished doesn't. The parent's agent reads the difference.
+ * A sub that goes away mid-run (SIGTERM, how pi-web stops a pi running elsewhere) and an rpc sub whose last run was
+ * aborted both report `stopped`, with their last words (pi records an abort mid-tool as an error; that echo isn't
+ * the report); a sub that finished doesn't. The parent's agent reads the difference.
  */
 export const stopped = async (): Promise<boolean> => {
 	const w = world("stopped");
@@ -416,14 +418,14 @@ export const stopped = async (): Promise<boolean> => {
 		const boss = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc"]));
 		const bossRecord = await waitUntil("boss online", () => presenceNamed(w, "boss"), ONLINE_TIMEOUT_MS);
 		const asSub = { PI_SESSION_ID: bossRecord.id };
-		const killed = spawnPi(w, piArgs(w, "killed", ["-p", SLEEPER_TASK]), REPO, asSub);
+		const killed = spawnPi(w, piArgs(w, "killed", ["-p", SAY_THEN_SLEEP]), REPO, asSub);
 		const aborted = spawnPi(w, piArgs(w, "aborted", ["--mode", "rpc"]), REPO, asSub);
 		const finisher = spawnPi(w, piArgs(w, "finisher", ["-p", "Reply with just the word OK."]), REPO, asSub);
 		const killedRecord = await waitUntil("killed busy", busyNamed(w, "killed"), ONLINE_TIMEOUT_MS);
 		const abortedRecord = await waitUntil("aborted online", () => presenceNamed(w, "aborted"), ONLINE_TIMEOUT_MS);
 		const finisherRecord = await waitUntil("finisher online", () => listPresence(w.store).find((record) => record.name === "finisher"), ONLINE_TIMEOUT_MS);
 		await sleep(STARTUP_GRACE_MS);
-		rpc(aborted, { id: "work", type: "prompt", message: SLEEPER_TASK });
+		rpc(aborted, { id: "work", type: "prompt", message: SAY_THEN_SLEEP });
 		await waitUntil("aborted busy", busyNamed(w, "aborted"), ONLINE_TIMEOUT_MS);
 		await waitUntil("both in their bash call", () => (toolCalls(sessionEntries(w, killedRecord.id), "bash").length > 0 && toolCalls(sessionEntries(w, abortedRecord.id), "bash").length > 0 ? true : undefined), 60_000);
 		await sleep(2_000);
@@ -448,12 +450,19 @@ export const stopped = async (): Promise<boolean> => {
 		const endedFrom = (record: Presence) => toBoss.filter((message) => isEnded(message, record.id));
 		const framing = (record: Presence) => framed.find(({ message }) => message.from.id === record.id)?.content ?? "";
 		const stoppedNote = "was stopped before it finished";
+		const lastSaid = (record: Presence) => assistantTexts(sessionEntries(w, record.id)).at(-1)?.text.trim() ?? "(it ended without a final message)";
+		const saidLast = (record: Presence) => endedFrom(record)[0]?.text === lastSaid(record) && !endedFrom(record)[0]?.text.includes("failed with an error");
 		checks.push(
 			check("all three are boss's subs", [killedRecord, abortedRecord, finisherRecord].every((record) => record.parent === bossRecord.id)),
 			check("SIGTERM mid-run: one ended, stopped", endedFrom(killedRecord).length === 1 && endedFrom(killedRecord)[0]?.stopped === true, JSON.stringify(endedFrom(killedRecord))),
 			check("an aborted last run: one ended, stopped", endedFrom(abortedRecord).length === 1 && endedFrom(abortedRecord)[0]?.stopped === true, JSON.stringify(endedFrom(abortedRecord))),
 			check("a finished pi -p: one ended, not stopped", endedFrom(finisherRecord).length === 1 && endedFrom(finisherRecord)[0]?.stopped === undefined && finisherDone.code === 0, JSON.stringify(endedFrom(finisherRecord))),
 			check("no died for any of them", !toBoss.some((message) => message.kind === "died")),
+			check(
+				"each stopped report is the sub's last words, not the stop's error echo",
+				[killedRecord, abortedRecord].every(saidLast),
+				JSON.stringify([killedRecord, abortedRecord].map((record) => [endedFrom(record)[0]?.text, lastSaid(record)])),
+			),
 			check("boss's agent read the stopped ones as stopped: inspect before relying on them", [killedRecord, abortedRecord].every((record) => framing(record).includes(stoppedNote) && framing(record).includes("Inspect its work")), clip(framing(killedRecord) + framing(abortedRecord))),
 			check("and the finished one as a report", framing(finisherRecord).includes("its report") && !framing(finisherRecord).includes(stoppedNote), clip(framing(finisherRecord))),
 			noExtensionErrors(killedDone.stderr + abortedDone.stderr + finisherDone.stderr + bossDone.stderr),

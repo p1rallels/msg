@@ -6,7 +6,7 @@ import { Type } from "typebox";
 import { expectation, formatDirectory, headline, replyText, targetLabel } from "./core/format.ts";
 import { LIST_ALL, LIST_DESCRIPTION, MAX_WAIT_SECONDS, PROMPT_GUIDELINES, PROMPT_SNIPPET, SEND_DESCRIPTION, SEND_TO } from "./core/guide.ts";
 import { DELIVERED_TTL_MS, OFFLINE_TTL_MS, sweepOrphans } from "./core/housekeeping.ts";
-import { assistantWords, endedText, lastWordsIn, relationOf, type RunState, startAs, wasStopped } from "./core/lineage.ts";
+import { endedText, noteWords, relationOf, reportWords, type RunState, startAs, type Words, wasStopped, wordsIn } from "./core/lineage.ts";
 import { ensureMailbox, pruneDelivered } from "./core/maildir.ts";
 import { type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
 import { isValidId, mailboxDirs, msgRoot } from "./core/paths.ts";
@@ -50,8 +50,8 @@ interface Live {
 	lastTickAt: number;
 	/** Since when this process has been running without a suspension gap. */
 	awakeSince: number;
-	/** The newest assistant text: the report an `ended` notice carries to the parent. */
-	lastWords: string | undefined;
+	/** What the agent last said: the report an `ended` notice carries to the parent. */
+	words: Words;
 	/** Where the agent's runs stand: an `ended` from a session that goes away mid-run, or after an aborted run, says `stopped`. */
 	run: RunState;
 }
@@ -123,8 +123,9 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		const parent = current.presence.parent;
 		if (parent === undefined) return;
 		try {
-			const exit = { kind: "ended", stopped: wasStopped(current.run) } as const;
-			const posted = postExit(root, senderOf(current.presence), parent, exit, endedText(current.lastWords, current.id), now);
+			const stopped = wasStopped(current.run);
+			const text = endedText(reportWords(current.words, stopped), current.id);
+			const posted = postExit(root, senderOf(current.presence), parent, { kind: "ended", stopped }, text, now);
 			if (!posted.ok) console.error(`[msg] could not tell the parent session this one ended: ${posted.error}`);
 		} catch (error) {
 			console.error(`[msg] could not tell the parent session this one ended: ${errorText(error)}`);
@@ -368,7 +369,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			lastScanAt: 0,
 			lastTickAt: now,
 			awakeSince: now,
-			lastWords: lastWordsIn(ctx.sessionManager.getBranch()),
+			words: wordsIn(ctx.sessionManager.getBranch()),
 			run: idle ? "none" : "running",
 		};
 		live = current;
@@ -439,8 +440,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		if (live) live.run = event.aborted ? "aborted" : "finished";
 	});
 	pi.on("message_end", (event) => {
-		const words = assistantWords(event.message);
-		if (words !== undefined && live) live.lastWords = words;
+		if (live) live.words = noteWords(live.words, event.message);
 	});
 
 	pi.registerMessageRenderer<Message>(CUSTOM_TYPE, (custom, { expanded, outputPad }, theme) => {

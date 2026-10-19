@@ -143,29 +143,41 @@ export const diedText = (death: Death, now: number): string => {
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
- * The text of an assistant message, or its error when it has none. Undefined for any other message, and for an
- * aborted one with no text: the words before it say more, and `stopped` says it was cut short.
+ * What a session last said: its newest assistant text, and the error of its newest assistant message when that one
+ * has no text: a failed run, or an abort (pi records an abort mid-tool as an error, not as `aborted`).
  */
-export const assistantWords = (message: unknown): string | undefined => {
-	if (!isRecord(message) || message.role !== "assistant") return undefined;
+export interface Words {
+	readonly text?: string;
+	readonly failure?: string;
+}
+
+const textOf = (message: Record<string, unknown>): string => {
 	const parts: unknown[] = Array.isArray(message.content) ? message.content : [];
-	const text = parts
+	return parts
 		.flatMap((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []))
 		.join("\n")
 		.trim();
-	if (text) return text;
-	if (message.stopReason === "aborted") return undefined;
-	const error = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
-	return error ? `(failed with an error: ${error})` : undefined;
 };
 
-const entryWords = (entry: unknown): string | undefined => (isRecord(entry) && entry.type === "message" ? assistantWords(entry.message) : undefined);
-
-/** The newest assistant message in a session branch that says something. */
-export const lastWordsIn = (entries: readonly unknown[]): string | undefined => {
-	const found = [...entries].reverse().find((entry) => entryWords(entry) !== undefined);
-	return found === undefined ? undefined : entryWords(found);
+/** Words after one more message. Only assistant messages count: one with text replaces the text, one without keeps it and says why (its error, if any). */
+export const noteWords = (words: Words, message: unknown): Words => {
+	if (!isRecord(message) || message.role !== "assistant") return words;
+	const text = textOf(message);
+	if (text) return { text };
+	const failure = typeof message.errorMessage === "string" ? message.errorMessage.trim() : "";
+	return { ...(words.text === undefined ? {} : { text: words.text }), ...(failure ? { failure } : {}) };
 };
+
+/** Words over a session branch, oldest entry first. */
+export const wordsIn = (entries: readonly unknown[]): Words =>
+	entries.reduce<Words>((words, entry) => (isRecord(entry) && entry.type === "message" ? noteWords(words, entry.message) : words), {});
+
+/**
+ * What an ended sub's report says: its newest text, or the error its last run failed with. A stopped sub's error is
+ * the stop's own echo, so it says its newest text, and `stopped` tells the rest.
+ */
+export const reportWords = (words: Words, stopped: boolean): string | undefined =>
+	stopped || words.failure === undefined ? words.text : `(failed with an error: ${words.failure})`;
 
 const morePointer = (rest: number, sessionId: string): string => `… [+${rest} chars: lookup last ${sessionId} -k assistant --full]`;
 

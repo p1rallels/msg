@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DELIVERED_TTL_MS } from "../src/core/housekeeping.ts";
 import {
-	assistantWords,
 	DEATH_WINDOW_MS,
 	diedText,
 	endedText,
@@ -9,14 +8,16 @@ import {
 	hasFamily,
 	inheritedParent,
 	isNoticeOf,
-	lastWordsIn,
 	lifeOf,
 	nestedRefusal,
+	noteWords,
 	relationOf,
+	reportWords,
 	type RunState,
 	startAs,
 	wasStopped,
 	watchChildren,
+	wordsIn,
 } from "../src/core/lineage.ts";
 import { createMessage, type Life, MAX_TEXT_BYTES, textBytes } from "../src/core/message.ts";
 import { type Presence, STALE_AFTER_MS } from "../src/core/registry.ts";
@@ -236,29 +237,44 @@ describe("last words", () => {
 	const assistant = (content: unknown[], extra: Record<string, unknown> = {}) => ({ role: "assistant", content, ...extra });
 	const entry = (message: unknown) => ({ type: "message", id: "e", message });
 
-	test("assistantWords: text parts joined, else the error, else nothing", () => {
-		expect(assistantWords(assistant([{ type: "thinking", thinking: "hmm" }, { type: "text", text: " done " }, { type: "text", text: "really" }]))).toBe(
-			"done \nreally",
-		);
-		expect(assistantWords(assistant([], { stopReason: "error", errorMessage: "overloaded" }))).toBe("(failed with an error: overloaded)");
-		expect(assistantWords(assistant([], { stopReason: "aborted", errorMessage: "This operation was aborted" }))).toBeUndefined();
-		expect(assistantWords(assistant([{ type: "text", text: "Half a thou" }], { stopReason: "aborted" }))).toBe("Half a thou");
-		expect(assistantWords(assistant([{ type: "toolCall", name: "bash" }]))).toBeUndefined();
-		expect(assistantWords({ role: "user", content: [{ type: "text", text: "hi" }] })).toBeUndefined();
-		expect(assistantWords(null)).toBeUndefined();
+	/** What pi records when a run is aborted mid-tool (Esc, an rpc abort): an error, not `aborted`. */
+	const abortedMidTool = assistant([], { stopReason: "error", errorMessage: "This operation was aborted" });
+
+	test("noteWords: an assistant text replaces the words; a message without text keeps them and says why", () => {
+		const said = noteWords({}, assistant([{ type: "thinking", thinking: "hmm" }, { type: "text", text: " done " }, { type: "text", text: "really" }]));
+		expect(said).toEqual({ text: "done \nreally" });
+		expect(noteWords(said, assistant([], { stopReason: "error", errorMessage: " overloaded " }))).toEqual({ text: "done \nreally", failure: "overloaded" });
+		expect(noteWords(said, abortedMidTool)).toEqual({ text: "done \nreally", failure: "This operation was aborted" });
+		expect(noteWords(said, assistant([{ type: "text", text: "Half a thou" }], { stopReason: "aborted" }))).toEqual({ text: "Half a thou" });
+		expect(noteWords(said, assistant([{ type: "toolCall", name: "bash" }]))).toEqual(said);
+		expect(noteWords({ text: "a", failure: "overloaded" }, assistant([{ type: "toolCall", name: "bash" }]))).toEqual({ text: "a" });
+		expect(noteWords({}, abortedMidTool)).toEqual({ failure: "This operation was aborted" });
+		expect(noteWords(said, { role: "user", content: [{ type: "text", text: "hi" }] })).toBe(said);
+		expect(noteWords(said, { role: "toolResult", content: [{ type: "text", text: "Command aborted" }] })).toBe(said);
+		expect(noteWords(said, null)).toBe(said);
 	});
 
-	test("lastWordsIn skips tool-only messages, aborted empties, users and custom entries", () => {
+	test("wordsIn folds a branch, skipping users, tool-only messages and custom entries", () => {
 		const entries = [
 			entry(assistant([{ type: "text", text: "first" }])),
 			entry(assistant([{ type: "text", text: "the report" }])),
 			entry({ role: "user", content: [{ type: "text", text: "later user text" }] }),
 			entry(assistant([{ type: "toolCall", name: "msg_send" }])),
-			entry(assistant([], { stopReason: "aborted", errorMessage: "This operation was aborted" })),
 			{ type: "custom_message", customType: "msg", content: "x" },
 		];
-		expect(lastWordsIn(entries)).toBe("the report");
-		expect(lastWordsIn([])).toBeUndefined();
+		expect(wordsIn(entries)).toEqual({ text: "the report" });
+		expect(wordsIn([...entries, entry(abortedMidTool)])).toEqual({ text: "the report", failure: "This operation was aborted" });
+		expect(wordsIn([])).toEqual({});
+	});
+
+	test("reportWords: a stopped sub says its newest text, never the stop's own error; a failed run says its error", () => {
+		const aborted = noteWords(noteWords({}, assistant([{ type: "text", text: "Running the migration tests now." }])), abortedMidTool);
+		expect(reportWords(aborted, true)).toBe("Running the migration tests now.");
+		expect(reportWords(noteWords({}, abortedMidTool), true)).toBeUndefined();
+		expect(reportWords({ text: "Starting.", failure: "overloaded" }, false)).toBe("(failed with an error: overloaded)");
+		expect(reportWords({ text: "all green" }, false)).toBe("all green");
+		expect(reportWords({ text: "all green" }, true)).toBe("all green");
+		expect(reportWords({}, false)).toBeUndefined();
 	});
 
 	test("endedText: the whole final message, however long, up to msg's message limit", () => {
