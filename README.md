@@ -201,5 +201,7 @@ Message ids are time-sortable (`0mv962x7b-67ef02`: base36 ms + random), so `ls n
 bun run check   # tsc + unit tests (temp stores, never touches ~/.pi)
 bun run e2e     # real pi sessions on anthropic/claude-haiku-5-5 (E2E_MODEL to change): rpc wake,
                 # headless pair, steer a busy run, two pi-web style SDK sessions in one Bun process,
-                # lineage (children started with the parent's PI_SESSION_ID: ask, ended, died, /msg)
+                # lineage (children started with the parent's PI_SESSION_ID: ask, ended, died, /msg),
+                # quick death (SIGKILL a second in → one died, SIGTERM → ended), offline death (killed
+                # while the parent is stopped → one died on resume, none on the next)
 ```
