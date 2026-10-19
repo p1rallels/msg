@@ -28,3 +28,16 @@ the pi extension (`src/extension.ts`, tools + live delivery) and the `msg` CLI (
 - Functions take their root dir / clock / pid probe as arguments, so tests never touch real state.
 - Functional style: small pure functions, early returns, no classes beyond namespaces.
 - Don't add comments that restate code.
+
+## working in a pfs fork
+
+- write only inside your fork. reads are open: other forks and the main folder are someone else's work in progress, so read them, never write there. `pfs ls` says which fork you're in (the `*`)
+- commit on your branch (`pfs/<n>-…`) when `bun run check` is clean, and `bun run e2e` too when you touched delivery, lineage or the extension's lifecycle. don't switch branches
+- finish clean: everything worth keeping is committed before your final message. `pfs rm` lands commits and nothing else
+- never delete a fork's folder by hand, yours or anyone's: `pfs rm` from the main folder is the only way out
+- don't push: a fork has your credentials and the network, but the main folder reviews, merges and pushes
+- forks are flat: `pfs new` fails in here. if the task needs more hands, say so in your final message
+- you may have a parent: the session that started you. blocked on a decision → `msg_send` to `"parent"` with `wait_seconds`. never message other forks' agents, never acknowledge. your final message is your report: your parent gets it when you end
+- `bun run check` and `bun run e2e` work in here: tests take a temp root and e2e runs pi with `--no-extensions -e ./src/extension.ts` on a temp `PI_MSG_DIR`, so neither touches the real store or the installed msg
+- install nothing: every pi session on this machine, yours included, loads msg from the main folder. no `pi install` / `pi remove`, no edits to `~/.pi/agent/settings.json`, never write to the real store (`~/.pi/agent/msg`). the main folder installs at fan-in
+- don't touch `.marbles/`, and edit README.md only where the task says: the main folder does docs and marbles at fan-in. say in your final message what README lines and e2e checks to add
