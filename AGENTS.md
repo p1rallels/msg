@@ -1,7 +1,8 @@
 # msg-cli
 
-Agent-to-agent messaging for pi sessions. One maildir store on disk, two front ends:
-the pi extension (`src/extension.ts`, tools + live delivery) and the `msg` CLI (`src/cli.ts`).
+Agent-to-agent messaging for pi sessions. One maildir store on disk, one front end: the pi extension
+(`src/extension.ts`: the `msg_list` and `msg_send` tools + live delivery). No CLI, no history: delivered
+messages live in the session files, and `lookup` reads those.
 
 ## Commands
 
@@ -9,7 +10,7 @@ the pi extension (`src/extension.ts`, tools + live delivery) and the `msg` CLI (
 - `bun run typecheck` — `tsc --noEmit`
 - `bun test` — unit tests (`test/*.test.ts`), never touch the real `~/.pi`: pass a temp root
 - `bun run check` — both, run before every commit
-- `bun src/cli.ts <cmd>` — the CLI from source
+- `bun run e2e [scenario…]` — real pi sessions on a temp store, real model calls (the list is in README.md)
 - `pi -e ./src/extension.ts` — load the extension for one pi run without installing it
 
 ## Layout
@@ -17,7 +18,6 @@ the pi extension (`src/extension.ts`, tools + live delivery) and the `msg` CLI (
 - `src/core/` — the protocol. Pure functions + plain `node:` fs. No pi imports, no Bun-only APIs
   (the extension runs under Node in the pi CLI and under Bun in pi-web).
 - `src/extension.ts` — pi adapter only: lifecycle, delivery, tools. No protocol logic.
-- `src/cli.ts` — CLI adapter only.
 
 ## Rules
 
@@ -26,6 +26,11 @@ the pi extension (`src/extension.ts`, tools + live delivery) and the `msg` CLI (
 - Every write to the store is atomic (write to `tmp/`, then `rename`). Readers must tolerate
   missing or half-written neighbours.
 - Functions take their root dir / clock / pid probe as arguments, so tests never touch real state.
+- Refuse, don't guess: `to` resolves only exact matches, and every refusal is one line saying what to
+  do instead.
+- Presence records and messages are a contract: pi-web and relay read the store, pi-web and lookup
+  render messages from session files (`kind`, `stopped`). Add optional fields, never repurpose one, and
+  keep old records and messages parsing (old messages carry `byUser` and `delivery`).
 - Functional style: small pure functions, early returns, no classes beyond namespaces.
 - Don't add comments that restate code.
 

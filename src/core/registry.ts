@@ -10,7 +10,7 @@ export const PRESENCE_VERSION = 1;
 export const STALE_AFTER_MS = 45_000;
 export const HEARTBEAT_EVERY_MS = 10_000;
 
-/** How the session runs: pi's own modes, `web` for pi-web, `cli` for the msg CLI acting as a session. */
+/** How the session runs: pi's own modes, `web` for pi-web; `cli` only in old records the msg CLI wrote before it was cut. */
 export type Mode = "tui" | "rpc" | "json" | "print" | "web" | "cli";
 export type Activity = "idle" | "busy";
 
