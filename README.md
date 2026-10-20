@@ -4,7 +4,7 @@ Agent-to-agent messaging for [pi](https://github.com/earendil-works/pi) sessions
 around one way of working: you chat with a **parent** session (in pi-web), it starts **subs** (`pi -p`
 runs from its bash, usually in pfs forks), and you always go through the parent. A sub asks its parent
 when it's blocked, and its final message reaches the parent whole, as its report. The parent ends its
-turn and is woken by its subs' questions, reports and deaths. Sessions with no parent message each
+turn and is woken by its subs' questions, reports, deaths and stalls. Sessions with no parent message each
 other by exact id, or by a folder or name with exactly one live session.
 
 A busy session gets a message at its next step; an idle one wakes up and handles it. Same idea as Amp's
@@ -69,7 +69,7 @@ is who started this process. A session with no parent is **top-level**.
   sub reports `ended`, stopped, with its last words. msg never runs it: the parent waits (a legit long
   command), `lookup`s the sub, or stops it
 
-Questions, reports and deaths all wake the parent, so a parent waits by ending its turn: no polling,
+Questions, reports, deaths and stalls all wake the parent, so a parent waits by ending its turn: no polling,
 no blocking tool. (Blocking in `pfs wait` instead deadlocks a sub that asks with `wait_seconds`: the
 question can't land until `pfs wait` returns.)
 
@@ -115,7 +115,7 @@ pi-web's rename.
 | tool | what it does |
 |---|---|
 | `msg_list` | who you are and who you can message. A sub sees itself and its parent. A parent sees itself and its subs. A top-level session sees every live session, someone else's subs marked `(lead's sub)`. `all: true` lists every session, offline ones included (a sub still sees only its parent). Each line: name · id · mode · busy/idle/ended · cwd · uptime |
-| `msg_send` | `to`, `message`. `wait_seconds` (max 3600, one recipient only) blocks for the reply and returns it as the tool result; a sub that ends or dies instead returns it too, with its report or its death. `reply_to` answers a message: a sender blocked on it gets the reply right away |
+| `msg_send` | `to`, `message`. `wait_seconds` (max 3600, one recipient only) blocks for the reply and returns it as the tool result; a sub that ends, dies or stalls instead returns it too, with its report, its death or its stall. `reply_to` answers a message: a sender blocked on it gets the reply right away |
 
 What the receiving agent sees (a pi custom message, `customType: "msg"`, `details` = the message):
 
@@ -141,6 +141,8 @@ Your sub scout was stopped before it finished (it went away mid-run, or its last
 ```
 
 A `died` notice says the sub's process is gone, it left no report, and to check its work in its folder.
+A `stalled` notice names the call the sub is stuck in (`bash: npm run dev`), for how long, its pid and
+`kill <pid>`, and lists the parent's options: wait, `lookup` the sub, or stop it.
 A message from a session that's neither your parent nor your sub reads "Message from another agent
 session (not your user)". Peer messages are never delivered as user messages: in pi and lookup, `user`
 means what a human typed.
@@ -154,11 +156,11 @@ means what a human typed.
   needs an answer asks with `wait_seconds`, which keeps it running until the reply comes or the wait
   runs out
 - **a waiting `msg_send`** gets first pick of its recipient's messages (a reply to it, a message
-  replying to nothing, its `ended` or `died`): they come back as its result instead of entering the
+  replying to nothing, its `ended`, `died` or `stalled`): they come back as its result instead of entering the
   conversation
 - **wake budget**: a session woken 20 times in 10 minutes without a human prompt stops waking; new
   messages are appended without starting a run until someone prompts it. Two top-level agents that keep
-  answering each other run out. A sub's messages, `ended` and `died` always wake its parent and don't
+  answering each other run out. A sub's messages, `ended`, `died` and `stalled` always wake its parent and don't
   count: the parent waits for them with its turn ended. (An idle `pi -p` sub is never woken, and an
   interactive sub's own budget still caps a ping-pong with its parent)
 - **offline sessions** keep their inbox; it's delivered when the session resumes. `msg_send` says so
@@ -169,13 +171,15 @@ means what a human typed.
 `$PI_MSG_DIR`, else `$PI_CODING_AGENT_DIR/msg`, else `~/.pi/agent/msg`; dirs 0700, files 0600.
 
 ```
-sessions/<session id>.json       presence: name, parent, cwd, pid, mode, busy/idle, heartbeat, endedAt
+sessions/<session id>.json       presence: name, parent, cwd, pid, mode, busy/idle, heartbeat, endedAt, call
 inbox/<session id>/tmp|new|cur/  maildir: written to tmp/, renamed into new/, claimed into cur/
 ```
 
 A message is one JSON file: `v`, `id`, `ts`, `from` (`id`, `name`, `cwd`), `to`, `text`, and when they
-apply `replyTo`, `awaitingUntil` (the sender blocks until then), `kind` (`ended` or `died`),
-`stopped: true` (only on `ended`) and `life` (on `died`: the pid and start of the life that died).
+apply `replyTo`, `awaitingUntil` (the sender blocks until then), `kind` (`ended`, `died` or `stalled`),
+`stopped: true` (only on `ended`), `life` (on `died` and `stalled`: the pid and start of the life it's
+about) and `call` (only on `stalled`: the stuck call's `id`, `name`, `preview` and `since`). A presence's
+`call` is the session's oldest running call that can stall it.
 Presence records and messages are a contract: pi-web and relay read the store, and pi-web and lookup
 render delivered messages (`stopped` included) from the session files. Messages from older versions may
 carry `byUser` or `delivery`: they still parse, and both are ignored.
@@ -237,7 +241,8 @@ pfs run "$n" --bg -q pi -n api-builder -p "$task"   # its parent is you: pi's ba
 
 Then the parent ends its turn. A sub's question wakes it: answer with `msg_send` + `reply_to`. A sub's
 `ended` report wakes it: read it in full, then review and merge (a `stopped` one: inspect its fork
-first), and `lookup` the sub's session for more. A `died` wakes it too: look into that fork.
+first), and `lookup` the sub's session for more. A `died` wakes it too: look into that fork. So does a
+`stalled`: wait if the command is a legit long one, `lookup` the sub, or run the notice's `kill <pid>`.
 `msg_send to: "$(pfs path $n)"` reaches the sub while it runs; `to: "children"` tells them all.
 
 The subs need nothing in their task: the guidelines already tell them to ask `parent` with
@@ -258,6 +263,8 @@ bun run e2e     # real pi sessions on anthropic/claude-haiku-5-5 (E2E_MODEL to c
                 # mid-run and an aborted rpc run report stopped, with their last words; a finished pi -p
                 # isn't stopped), quick death
                 # (SIGKILL a second in → one died, SIGTERM → ended), offline death (killed while the parent
-                # is stopped → one died on resume, none on the next)
+                # is stopped → one died on resume, none on the next), stalled (a sub stuck in `sleep 613` →
+                # one stalled naming the call and `kill <pid>`; running it → ended, stopped, and the sleep
+                # is gone; a sub blocked in msg_send past the threshold → none)
 bun run e2e wall nested   # just those
 ```
