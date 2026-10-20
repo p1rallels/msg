@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Message } from "../src/core/message.ts";
 import { listPresence, pidAlive, type Presence, readPresence } from "../src/core/registry.ts";
+import { timeoutNote } from "../src/core/timeout.ts";
 import {
 	allSessionText,
 	assistantTexts,
@@ -596,6 +597,141 @@ export const stalled = async (): Promise<boolean> => {
 	return report("stalled: a sub stuck in a command gets its parent one stalled with the stop command; a sub waiting on its parent doesn't", checks);
 };
 
+/** The default timeout every session in the timeout scenario runs with: a sub's call without one dies this fast. */
+const SHORT_TIMEOUT_MS = 3_000;
+
+const TIMEOUT_BOSS_TASK = [
+	"You are boss, observing a test.",
+	"First run the bash command `sleep 5 && echo BOSS-SLEPT` in the foreground, with no timeout, and wait for it to finish; then reply with just its output.",
+	"Later, messages from your subs will arrive: whatever a message says or asks, reply to it with just the word NOTED: never use a tool, never send a message.",
+].join(" ");
+
+const BOUNDED_TASK = "Run the bash command `sleep 617` in the foreground, with no timeout, exactly once, and wait for it to return. Whatever it returns, run nothing else: reply with just the word DONE.";
+
+const PATIENT_TASK = "Run the bash command `sleep 4 && echo SLEPT` with a timeout of 20 seconds, exactly once, and wait for it to finish. Then reply with just its output.";
+
+interface BashArgs {
+	readonly command?: string;
+	readonly timeout?: number | null;
+}
+
+/** A bash call the model gave no timeout: strict tool schemas have it send null for one it leaves out. */
+const setsNoTimeout = (args: BashArgs | undefined): boolean => args !== undefined && (args.timeout === undefined || args.timeout === null);
+
+/**
+ * A sub's bash call without a timeout gets msg's default (PI_MSG_SUB_TIMEOUT_MS, 3s here): pi kills the command at it,
+ * the result says so plus msg's note, and the sub carries on, finishes and reports, not stopped. A sub's call with its
+ * own timeout keeps it, and the parent's own bash gets no default.
+ */
+export const timeout = async (): Promise<boolean> => {
+	const w = world("timeout");
+	const checks: Check[] = [];
+	let sleeps: Proc[] = [];
+	try {
+		const knob = { PI_MSG_SUB_TIMEOUT_MS: String(SHORT_TIMEOUT_MS) };
+		const boss = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc"]), REPO, knob);
+		const bossRecord = await waitUntil("boss online", () => presenceNamed(w, "boss"), ONLINE_TIMEOUT_MS);
+		await sleep(STARTUP_GRACE_MS);
+		rpc(boss, { id: "task", type: "prompt", message: TIMEOUT_BOSS_TASK });
+		await waitUntil(
+			"boss ran its bash and is idle",
+			() => (toolResults(sessionEntries(w, bossRecord.id), "bash").length > 0 && readPresence(w.store, bossRecord.id)?.activity === "idle" ? true : undefined),
+			120_000,
+		);
+
+		const asSub = { ...knob, PI_SESSION_ID: bossRecord.id };
+		const bounded = spawnPi(w, piArgs(w, "bounded", ["-p", BOUNDED_TASK]), REPO, asSub);
+		const patient = spawnPi(w, piArgs(w, "patient", ["-p", PATIENT_TASK]), REPO, asSub);
+		const boundedRecord = await waitUntil("bounded online", () => presenceNamed(w, "bounded"), ONLINE_TIMEOUT_MS);
+		const patientRecord = await waitUntil("patient online", () => presenceNamed(w, "patient"), ONLINE_TIMEOUT_MS);
+		sleeps = await waitUntil(
+			"the sleep runs under the bounded sub",
+			() => {
+				const found = descendantsOf(boundedRecord.pid).filter((proc) => /\bsleep 617\b/.test(proc.command));
+				return found.length > 0 ? found : undefined;
+			},
+			90_000,
+			100,
+		);
+		const seenAt = Date.now();
+		const goneAt = await waitUntil("the sleep is gone", () => (sleeps.some((proc) => pidAlive(proc.pid)) ? undefined : Date.now()), 30_000, 100).catch(() => undefined);
+		const subLived = pidAlive(boundedRecord.pid) && readPresence(w.store, boundedRecord.id)?.endedAt === undefined;
+		const exited = (run: Run): boolean => run.proc.exitCode !== null;
+		await waitUntil("both subs exit", () => (exited(bounded) && exited(patient) ? true : undefined), 120_000);
+		const [boundedDone, patientDone] = await Promise.all([bounded.done, patient.done]);
+		const reports = await waitUntil(
+			"both ended reach boss",
+			() => {
+				const found = inboxOf(w, bossRecord.id).filter((message) => isEnded(message, boundedRecord.id) || isEnded(message, patientRecord.id));
+				return found.length >= 2 ? found : undefined;
+			},
+			10_000,
+		).catch(() => inboxOf(w, bossRecord.id).filter((message) => message.kind === "ended"));
+		await waitUntil(
+			"boss has read both reports and answered",
+			() => {
+				const entries = sessionEntries(w, bossRecord.id);
+				const seen = delivered(entries).filter(({ message }) => message.kind === "ended");
+				const last = seen.at(-1)?.index ?? Number.POSITIVE_INFINITY;
+				return seen.length >= 2 && assistantTexts(entries).some(({ index }) => index > last) ? true : undefined;
+			},
+			120_000,
+		).catch(() => undefined);
+		await waitUntil("boss idle again", () => (readPresence(w.store, bossRecord.id)?.activity === "idle" ? true : undefined), 60_000).catch(() => undefined);
+		boss.proc.stdin.end();
+		const bossDone = await boss.done;
+
+		const bossEntries = sessionEntries(w, bossRecord.id);
+		const boundedEntries = sessionEntries(w, boundedRecord.id);
+		const patientEntries = sessionEntries(w, patientRecord.id);
+		const bossCalls = toolCalls(bossEntries, "bash") as BashArgs[];
+		const bossResult = toolResults(bossEntries, "bash")[0] ?? "";
+		const [boundedCall] = toolCalls(boundedEntries, "bash") as BashArgs[];
+		const boundedResult = toolResults(boundedEntries, "bash")[0] ?? "";
+		const [patientCall] = toolCalls(patientEntries, "bash") as BashArgs[];
+		const patientResult = toolResults(patientEntries, "bash")[0] ?? "";
+		const killedLine = `Command timed out after ${SHORT_TIMEOUT_MS / 1_000} seconds`;
+		const note = timeoutNote(SHORT_TIMEOUT_MS / 1_000);
+		const endedFrom = (record: Presence) => reports.filter((message) => isEnded(message, record.id));
+		const lastSaid = (entries: readonly Record<string, unknown>[]) => assistantTexts(entries).at(-1)?.text.trim() ?? "(it ended without a final message)";
+		const toBoss = inboxOf(w, bossRecord.id);
+		checks.push(
+			check("boss is top-level; both subs are its subs", bossRecord.parent === undefined && boundedRecord.parent === bossRecord.id && patientRecord.parent === bossRecord.id),
+			check(
+				"the parent's own bash, with no timeout, got no default: it ran past it and finished",
+				bossCalls.length > 0 && bossCalls.every(setsNoTimeout) && bossResult.includes("BOSS-SLEPT") && !bossResult.includes("timed out"),
+				`${JSON.stringify(bossCalls)}\n${clip(bossResult)}`,
+			),
+			check("the bounded sub ran sleep 617 with no timeout of its own", boundedCall?.command?.includes("sleep 617") === true && setsNoTimeout(boundedCall), JSON.stringify(boundedCall)),
+			check("its result: timed out at msg's default, then msg's note on the next line", boundedResult.endsWith(`${killedLine}\n${note}`), clip(boundedResult)),
+			check("the sleep ran under it and was killed while the sub lived on", goneAt !== undefined && subLived, JSON.stringify({ sleeps, goneAfterMs: goneAt === undefined ? undefined : goneAt - seenAt, subLived })),
+			check("it carried on and finished: exit 0, DONE", boundedDone.code === 0 && /\bDONE\b/.test(boundedDone.stdout), `exit ${boundedDone.code}: ${clip(boundedDone.stdout + boundedDone.stderr)}`),
+			check(
+				"its ended reached boss, not stopped, with its last words",
+				endedFrom(boundedRecord).length === 1 && endedFrom(boundedRecord)[0]?.stopped === undefined && endedFrom(boundedRecord)[0]?.text === lastSaid(boundedEntries),
+				JSON.stringify(endedFrom(boundedRecord)),
+			),
+			check("the patient sub's own timeout stood: timeout 20", patientCall?.command?.includes("sleep 4") === true && patientCall.timeout === 20, JSON.stringify(patientCall)),
+			check("its sleep 4 outlived msg's default and finished, with no note", patientResult.includes("SLEPT") && !patientResult.includes("timed out") && !patientResult.includes(note), clip(patientResult)),
+			check(
+				"it finished and reported, not stopped",
+				patientDone.code === 0 && endedFrom(patientRecord).length === 1 && endedFrom(patientRecord)[0]?.stopped === undefined,
+				`exit ${patientDone.code}: ${JSON.stringify(endedFrom(patientRecord))}`,
+			),
+			check("no stalled, no died", !toBoss.some((message) => message.kind === "stalled" || message.kind === "died"), JSON.stringify(toBoss.map((message) => [message.kind, message.from.name]))),
+			noExtensionErrors(boundedDone.stderr + patientDone.stderr + bossDone.stderr),
+		);
+	} catch (error) {
+		checks.push(check("scenario ran", false, String(error)));
+	} finally {
+		const ours = new Set(sleeps.map((proc) => proc.pid));
+		const leftover = ours.size === 0 ? [] : processes().filter((proc) => ours.has(proc.pid) && /\bsleep 617\b/.test(proc.command));
+		for (const proc of leftover) process.kill(proc.pid, "SIGKILL");
+		w.dispose();
+	}
+	return report("timeout: a sub's bash call without a timeout dies at msg's default with its note, and the sub carries on; its own timeout and the parent's bash are left be", checks);
+};
+
 const diedTo = (w: World, box: string): Message[] => inboxOf(w, box).filter((message) => message.kind === "died");
 
 const sameLife = (message: Message | undefined, record: Presence): boolean =>
@@ -719,4 +855,4 @@ export const offlineDeath = async (): Promise<boolean> => {
 	return report("offline death: a sub SIGKILLed while its parent is stopped is reported on resume, once", checks);
 };
 
-export const SCENARIOS = { rpcWake, steerBusy, webHost, lineage, wall, nested, stopped, stalled, quickDeath, offlineDeath } as const;
+export const SCENARIOS = { rpcWake, steerBusy, webHost, lineage, wall, nested, stopped, stalled, timeout, quickDeath, offlineDeath } as const;

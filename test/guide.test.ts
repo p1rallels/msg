@@ -22,6 +22,13 @@ describe("guidelines per role, in every session's prompt", () => {
 		expect(sub).toContain("Your final message is your report");
 	});
 
+	test("a sub: bash calls without a timeout stop after 5 min; servers and watchers go in the background, long suites get a timeout", () => {
+		expect(bullet("You're its sub")).toContain(
+			"Your bash calls without a `timeout` stop after 5 min (nobody watches a sub's terminal): run servers and watchers in the background, give long suites a `timeout`.",
+		);
+		for (const other of PROMPT_GUIDELINES.filter((line) => !line.includes("You're its sub"))) expect(other).not.toContain("timeout");
+	});
+
 	test("a parent: woken by its subs, ends its turn instead of polling, answers with reply_to, reads reports in full, lookup for more", () => {
 		const parent = bullet("are your subs");
 		expect(parent).toContain('reports (kind="ended"), deaths (kind="died") and stalls (kind="stalled") wake you');

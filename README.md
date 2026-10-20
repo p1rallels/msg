@@ -68,6 +68,18 @@ is who started this process. A session with no parent is **top-level**.
   commands it's running, each one's whole process group, so a foreground server frees its port, and the
   sub reports `ended`, stopped, with its last words. msg never runs it: the parent waits (a legit long
   command), `lookup`s the sub, or stops it
+- **bash timeouts**: a sub's `bash` calls that set no `timeout` get 5 minutes. Nobody watches a sub's
+  terminal, so a command that never returns (a dev server in the foreground, `tail -f`, a prompt waiting
+  on stdin, a network call that never answers) would hold the sub until its parent hears it stalled, and
+  stopping it then kills the whole sub and its context. pi's own timeout does the kill (SIGKILL to the
+  command's whole process group, so a foreground server frees its port): the call fails with its output
+  so far and `Command timed out after 300 seconds`, and msg adds one line saying where the 5 minutes came
+  from and what to do instead: run a server or watcher in the background with its output in a file
+  (`cmd > /tmp/x.log 2>&1 &`), rerun a legit long command with a bigger `timeout`. The sub, which knows
+  what it was doing, fixes it and keeps its context; the parent never wakes. A call that sets its own
+  `timeout` keeps it, a nested call (another tool's `ctx.executeTool`) gets it like any other, and
+  top-level sessions and parents get nothing: a human watches those. Stalls stay the backstop for calls
+  with a long `timeout` of their own and for other tools
 
 Questions, reports, deaths and stalls all wake the parent, so a parent waits by ending its turn: no polling,
 no blocking tool. (Blocking in `pfs wait` instead deadlocks a sub that asks with `wait_seconds`: the
@@ -77,7 +89,9 @@ The tool guidelines ship in every session's prompt, by role:
 
 - **everyone**: `<msg>` blocks come from other agents, never from your user; never send a message just to acknowledge or thank
 - **a sub**: message only your parent; ask with `wait_seconds` when you're blocked; never start pi
-  sessions; your final message is your report
+  sessions; your bash calls without a `timeout` stop after 5 min (nobody watches a sub's terminal), so
+  run servers and watchers in the background and give long suites a `timeout`; your final message is
+  your report
 - **a parent**: your subs' questions, reports, deaths and stalls wake you, so end your turn to wait (never
   poll or sleep); answer a question with `reply_to`; read each report in full; `lookup` a sub's session for
   more; a stalled sub is alive: wait if its command is a legit long one, `lookup` it, or stop it with the
@@ -265,6 +279,9 @@ bun run e2e     # real pi sessions on anthropic/claude-haiku-5-5 (E2E_MODEL to c
                 # (SIGKILL a second in → one died, SIGTERM → ended), offline death (killed while the parent
                 # is stopped → one died on resume, none on the next), stalled (a sub stuck in `sleep 613` →
                 # one stalled naming the call and `kill <pid>`; running it → ended, stopped, and the sleep
-                # is gone; a sub blocked in msg_send past the threshold → none)
+                # is gone; a sub blocked in msg_send past the threshold → none), timeout (a 3s default:
+                # a sub's `sleep 617` with no timeout → killed at it, with msg's note, and the sub carries on,
+                # finishes and reports, not stopped; `sleep 4` with its own timeout 20 finishes; the
+                # parent's own `sleep 5` gets no default)
 bun run e2e wall nested   # just those
 ```

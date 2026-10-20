@@ -30,6 +30,7 @@ import { directory, HEARTBEAT_EVERY_MS, type Mode, pidAlive, type Presence, prun
 import type { Target } from "./core/resolve.ts";
 import { fail, ok, type Result } from "./core/result.ts";
 import { canAnswer, findRecipients, type Outgoing, post, postExit, senderOf } from "./core/send.ts";
+import { defaultTimeout, subTimeout, withTimeoutNote } from "./core/timeout.ts";
 import { createWaiters, isReplyTo, type Waiters } from "./core/waiters.ts";
 import { type ChildWatch, lookAfterChildren, newWatch, type Scope } from "./core/watch.ts";
 
@@ -70,6 +71,8 @@ interface Live {
 	run: RunState;
 	/** The tool calls running that can stall this session, oldest first. The oldest is in its presence, for its parent to judge. */
 	calls: readonly Call[];
+	/** The bash calls running with the timeout msg gave them, by tool call id: the seconds it gave. */
+	readonly defaulted: Map<string, number>;
 }
 
 /** How a session stops: `ended` tells its parent (it's over), `quiet` doesn't (a reload, a restart of the same session). */
@@ -115,6 +118,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	const root = msgRoot(process.env);
 	const home = homedir();
 	const stalledAfterMs = stalledAfter(process.env);
+	const subTimeoutSeconds = subTimeout(process.env);
 	let live: Live | undefined;
 	/** Why msg couldn't start in this session, for the tools to explain. */
 	let unavailable: string | undefined;
@@ -402,6 +406,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			words: wordsIn(ctx.sessionManager.getBranch()),
 			run: idle ? "none" : "running",
 			calls: [],
+			defaulted: new Map(),
 		};
 		live = current;
 		current.watcher = watchInbox(current);
@@ -471,6 +476,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		if (!live) return;
 		live.run = event.aborted ? "aborted" : "finished";
 		trackCalls(live, []);
+		live.defaulted.clear();
 	});
 	pi.on("message_end", (event) => {
 		if (live) live.words = noteWords(live.words, event.message);
@@ -478,8 +484,22 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	pi.on("tool_execution_start", (event) => {
 		if (live) trackCalls(live, callStarted(live.calls, event, Date.now()));
 	});
+	pi.on("tool_call", (event) => {
+		if (!live) return undefined;
+		const seconds = defaultTimeout(live.presence, event, subTimeoutSeconds);
+		if (seconds === undefined) return undefined;
+		Object.assign(event.input, { timeout: seconds });
+		live.defaulted.set(event.toolCallId, seconds);
+		return undefined;
+	});
+	pi.on("tool_result", (event) => {
+		const content = withTimeoutNote(event, live?.defaulted.get(event.toolCallId));
+		return content === undefined ? undefined : { content, structuredContent: event.structuredContent };
+	});
 	pi.on("tool_execution_end", (event) => {
-		if (live) trackCalls(live, callEnded(live.calls, event.toolCallId));
+		if (!live) return;
+		trackCalls(live, callEnded(live.calls, event.toolCallId));
+		live.defaulted.delete(event.toolCallId);
 	});
 
 	pi.registerMessageRenderer<Message>(CUSTOM_TYPE, (custom, { expanded, outputPad }, theme) => {
