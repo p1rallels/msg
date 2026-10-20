@@ -433,6 +433,20 @@ describe("stalls", () => {
 		);
 	});
 
+	test("stalledText with the stuck command's group: stop just that command first (msg_send it first to say what instead), then the whole sub, then leave it", () => {
+		const kid = child("a", { name: "builder", pid: 4242, heartbeatAt: now - 3_000 });
+		expect(stalledText({ child: kid, call: call("c1", now - 12 * 60_000, "npm run dev -- --port 3000") }, now, 5001)).toBe(
+			[
+				"builder has been stuck in one tool call for 12m, since 1970-01-30T23:48:00Z:",
+				"bash: npm run dev -- --port 3000",
+				"It's alive (pid 4242, last heartbeat 3s ago) but can't go on until that call returns.",
+				"To stop just that command, run `kill -- -5001` (its process group): the call comes back failed and builder carries on, context intact. To tell it what to do instead, msg_send it first: a busy sub reads your message as soon as its running calls return, before its next step.",
+				"To stop builder itself, run `kill 4242`: pi kills the commands it's running (each one's whole process group) and ends, and builder reports ended, stopped, with its last words.",
+				"Or leave it, if that's a legit long command: you won't hear about this call again.",
+			].join("\n"),
+		);
+	});
+
 	test("stalledText: a call without a preview is named by its tool alone", () => {
 		const text = stalledText({ child: child("a"), call: { id: "c1", name: "wait_for_ci", since: now - 3 * 3_600_000 } }, now);
 		expect(text.split("\n").slice(0, 2)).toEqual(["a has been stuck in one tool call for 3h, since 1970-01-30T21:00:00Z:", "wait_for_ci"]);

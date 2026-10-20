@@ -1,3 +1,4 @@
+import { namesGroupStop } from "./group.ts";
 import { newMessageId, type RandomHex, randomHex } from "./ids.ts";
 import { isValidId } from "./paths.ts";
 import { fail, ok, type Result } from "./result.ts";
@@ -240,6 +241,10 @@ const replyHint = (message: Message, now: number): string => {
 	return `To answer, ${call}. Don't reply just to acknowledge.`;
 };
 
+/** How a stalled sub can be stopped: just its stuck command, when the notice names that command's group, or the whole sub. */
+const stallStops = (message: Message): string =>
+	namesGroupStop(message.text) ? "stop it with a command above: just the stuck command (msg_send it what to do instead first), or the whole sub." : "stop it with the command above.";
+
 const exitNote = (message: Message, kind: Kind, relation: Relation | undefined): string => {
 	const who = `${relation === "child" ? "Your sub" : "Session"} ${partyLabel(message.from)}`;
 	const where = message.from.cwd ? ` in ${message.from.cwd}` : "";
@@ -253,7 +258,7 @@ const exitNote = (message: Message, kind: Kind, relation: Relation | undefined):
 		case "died":
 			return `${who} died: its process is gone and it left no report. Check its work${where} before relying on it.`;
 		case "stalled":
-			return `${who} is stalled: alive, but stuck in the tool call above, so it can't go on, answer or report until that call returns. msg won't stop it, and won't tell you about this call again. Your call: wait if that's a legit long command (its report still wakes you), \`lookup catchup ${message.from.id}\` to see what it's doing, or stop it with the command above.`;
+			return `${who} is stalled: alive, but stuck in the tool call above, so it can't go on, answer or report until that call returns. msg won't stop it, and won't tell you about this call again. Your call: wait if that's a legit long command (its report still wakes you), \`lookup catchup ${message.from.id}\` to see what it's doing, or ${stallStops(message)}`;
 	}
 };
 

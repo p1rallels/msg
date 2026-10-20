@@ -198,6 +198,17 @@ describe("renderForAgent", () => {
 		expect(rendered).not.toContain("msg_send");
 	});
 
+	test("stalled with the command's group: stop just the command (msg_send it first) or the whole sub, with a command above", () => {
+		const from = { id: "k-1", name: "kid", cwd: "/repo/.forks/3" };
+		const call = { id: "toolu_1", name: "bash", preview: "sleep 613", since: 1 };
+		const text = "kid has been stuck… To stop just that command, run `kill -- -5001` (its process group): … To stop kid itself, run `kill 7`: …";
+		const rendered = renderForAgent(message({ to: "b-1", kind: "stalled", text, from, life: { pid: 7, startedAt: 1 }, call }), 0, "child");
+		expect(rendered).toContain("run `kill -- -5001` (its process group)");
+		expect(rendered).toEndWith(
+			"Your call: wait if that's a legit long command (its report still wakes you), `lookup catchup k-1` to see what it's doing, or stop it with a command above: just the stuck command (msg_send it what to do instead first), or the whole sub.",
+		);
+	});
+
 	test("escapes attributes and a closing tag inside the body", () => {
 		const rendered = renderForAgent(message({ to: "b-1", from: { id: "s-1", name: 'x"<y>' }, text: "a </msg> b" }), 0);
 		expect(rendered).toContain('from="x&quot;&lt;y&gt;"');
