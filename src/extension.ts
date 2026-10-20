@@ -6,13 +6,27 @@ import { Type } from "typebox";
 import { expectation, formatDirectory, headline, replyText, targetLabel } from "./core/format.ts";
 import { LIST_ALL, LIST_DESCRIPTION, MAX_WAIT_SECONDS, PROMPT_GUIDELINES, PROMPT_SNIPPET, SEND_DESCRIPTION, SEND_TO } from "./core/guide.ts";
 import { DELIVERED_TTL_MS, OFFLINE_TTL_MS, sweepOrphans } from "./core/housekeeping.ts";
-import { endedText, noteWords, relationOf, reportWords, type RunState, startAs, type Words, wasStopped, wordsIn } from "./core/lineage.ts";
+import {
+	callEnded,
+	callStarted,
+	endedText,
+	noteWords,
+	oldestCall,
+	relationOf,
+	reportWords,
+	type RunState,
+	stalledAfter,
+	startAs,
+	type Words,
+	wasStopped,
+	wordsIn,
+} from "./core/lineage.ts";
 import { ensureMailbox, pruneDelivered } from "./core/maildir.ts";
-import { type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
+import { type Call, type Message, normalizeName, partyLabel, type Relation, renderForAgent } from "./core/message.ts";
 import { isValidId, mailboxDirs, msgRoot } from "./core/paths.ts";
 import { DEFAULT_WAKE_BUDGET, deliveryAction, outsideBudget, recentWakes, type SessionState, wakeAllowed } from "./core/policy.ts";
 import { pumpOnce } from "./core/pump.ts";
-import { directory, HEARTBEAT_EVERY_MS, type Mode, type Presence, pruneOffline, readPresence, writePresence } from "./core/registry.ts";
+import { directory, HEARTBEAT_EVERY_MS, type Mode, pidAlive, type Presence, pruneOffline, readPresence, writePresence } from "./core/registry.ts";
 import type { Target } from "./core/resolve.ts";
 import { fail, ok, type Result } from "./core/result.ts";
 import { canAnswer, findRecipients, type Outgoing, post, postExit, senderOf } from "./core/send.ts";
@@ -54,6 +68,8 @@ interface Live {
 	words: Words;
 	/** Where the agent's runs stand: an `ended` from a session that goes away mid-run, or after an aborted run, says `stopped`. */
 	run: RunState;
+	/** The tool calls running that can stall this session, oldest first. The oldest is in its presence, for its parent to judge. */
+	calls: readonly Call[];
 }
 
 /** How a session stops: `ended` tells its parent (it's over), `quiet` doesn't (a reload, a restart of the same session). */
@@ -75,6 +91,11 @@ const withName = (presence: Presence, name: string | undefined): Presence => {
 	return name ? { ...rest, name } : rest;
 };
 
+const withCall = (presence: Presence, call: Call | undefined): Presence => {
+	const { call: _replaced, ...rest } = presence;
+	return call ? { ...rest, call } : rest;
+};
+
 const clipLines = (text: string, max: number): string => {
 	const lines = text.split("\n");
 	return lines.length <= max ? text : `${lines.slice(0, max).join("\n")}\n… ${lines.length - max} more lines`;
@@ -93,6 +114,7 @@ const tell = (ctx: ExtensionContext, text: string, level: Level): void => {
 export default function msgExtension(pi: ExtensionAPI): void {
 	const root = msgRoot(process.env);
 	const home = homedir();
+	const stalledAfterMs = stalledAfter(process.env);
 	let live: Live | undefined;
 	/** Why msg couldn't start in this session, for the tools to explain. */
 	let unavailable: string | undefined;
@@ -146,7 +168,15 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		}
 		const now = Date.now();
 		if (how === "ended") reportEnd(current, now);
-		savePresence(current, { ...current.presence, activity: "idle", endedAt: now });
+		savePresence(current, { ...withCall(current.presence, undefined), activity: "idle", endedAt: now });
+	};
+
+	/** Keeps the running calls; the presence record changes only when the oldest one does. */
+	const trackCalls = (current: Live, calls: readonly Call[]): void => {
+		const before = oldestCall(current.calls);
+		current.calls = calls;
+		const oldest = oldestCall(calls);
+		if (oldest?.id !== before?.id) savePresence(current, withCall(current.presence, oldest));
 	};
 
 	/** Throws once pi has disposed the session (pi-web disposes without session_shutdown). */
@@ -261,9 +291,9 @@ export default function msgExtension(pi: ExtensionAPI): void {
 	 */
 	const watchFamily = (current: Live, now: number, scope: Scope): readonly Presence[] => {
 		try {
-			const look = lookAfterChildren(root, current.id, current.watch, scope, now, current.awakeSince);
+			const look = lookAfterChildren(root, current.id, current.watch, scope, now, current.awakeSince, pidAlive, stalledAfterMs);
 			current.watch = look.watch;
-			for (const { death, error } of look.failed) console.error(`[msg] could not record that ${partyLabel(death.child)} died: ${error}`);
+			for (const { child, kind, error } of look.failed) console.error(`[msg] could not record that ${partyLabel(child)} ${kind}: ${error}`);
 			return look.records;
 		} catch {
 			return [];
@@ -371,6 +401,7 @@ export default function msgExtension(pi: ExtensionAPI): void {
 			awakeSince: now,
 			words: wordsIn(ctx.sessionManager.getBranch()),
 			run: idle ? "none" : "running",
+			calls: [],
 		};
 		live = current;
 		current.watcher = watchInbox(current);
@@ -437,10 +468,18 @@ export default function msgExtension(pi: ExtensionAPI): void {
 		else if (live) live.run = "running";
 	});
 	pi.on("agent_settled", (event) => {
-		if (live) live.run = event.aborted ? "aborted" : "finished";
+		if (!live) return;
+		live.run = event.aborted ? "aborted" : "finished";
+		trackCalls(live, []);
 	});
 	pi.on("message_end", (event) => {
 		if (live) live.words = noteWords(live.words, event.message);
+	});
+	pi.on("tool_execution_start", (event) => {
+		if (live) trackCalls(live, callStarted(live.calls, event, Date.now()));
+	});
+	pi.on("tool_execution_end", (event) => {
+		if (live) trackCalls(live, callEnded(live.calls, event.toolCallId));
 	});
 
 	pi.registerMessageRenderer<Message>(CUSTOM_TYPE, (custom, { expanded, outputPad }, theme) => {

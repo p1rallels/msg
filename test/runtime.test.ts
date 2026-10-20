@@ -52,11 +52,13 @@ describe("waiters", () => {
 		expect(match(message({ to: "alice", from: { id: "carol" }, replyTo: sent.id }))).toBe(false);
 	});
 
-	test("isReplyTo: a recipient that ends, is stopped or dies instead of replying unblocks the sender too", () => {
+	test("isReplyTo: a recipient that ends, is stopped, dies or stalls instead of replying unblocks the sender too", () => {
 		const sent = message({ to: "kid", from: { id: "boss" } });
 		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "ended" }))).toBe(true);
 		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "ended", stopped: true }))).toBe(true);
 		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "died" }))).toBe(true);
+		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "kid" }, kind: "stalled" }))).toBe(true);
+		expect(isReplyTo(sent)(message({ to: "boss", from: { id: "other" }, kind: "stalled" }))).toBe(false);
 	});
 });
 
@@ -84,6 +86,7 @@ describe("deliveryAction", () => {
 		expect(outsideBudget(message({ to: "boss" }), "child")).toBe(true);
 		expect(outsideBudget(message({ to: "boss", kind: "ended" }), undefined)).toBe(true);
 		expect(outsideBudget(message({ to: "boss", kind: "died" }), "child")).toBe(true);
+		expect(outsideBudget(message({ to: "boss", kind: "stalled" }), "child")).toBe(true);
 		expect(outsideBudget(message({ to: "kid" }), "parent")).toBe(false);
 		expect(outsideBudget(message({ to: "peer" }), undefined)).toBe(false);
 	});

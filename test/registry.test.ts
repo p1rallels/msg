@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureDir } from "../src/core/fsx.ts";
 import { sessionsDir } from "../src/core/paths.ts";
-import { directory, isLive, listPresence, parsePresence, pidAlive, pruneOffline, readPresence, readSessions, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
+import { directory, isLive, listPresence, parsePresence, pidAlive, type Presence, pruneOffline, readPresence, readSessions, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
 import { LIKELY_LISTED, resolveTarget } from "../src/core/resolve.ts";
 import { presence, tempRoot } from "./helpers.ts";
 
@@ -168,6 +168,40 @@ describe("resolveTarget: strict", () => {
 		);
 		const result = resolveTarget("gone", many, { id: "asker" }, { home: "/home/u" }, now);
 		expect(result.ok ? "" : result.error.split("; ").length).toBe(LIKELY_LISTED);
+	});
+});
+
+describe("presence call: the oldest tool call that can stall the session", () => {
+	const call = { id: "toolu_01Abc", name: "bash", preview: "sleep 613", since: 5_000 };
+
+	test("an old record, without one, still parses, and has none", () => {
+		const old: Presence = { v: 1, id: "s-1", name: "kid", parent: "p-1", cwd: "/x", pid: 7, mode: "print", activity: "busy", startedAt: 1, heartbeatAt: 2 };
+		const parsed = parsePresence(old);
+		expect(parsed.ok && parsed.value).toEqual(old);
+		expect(parsed.ok && "call" in parsed.value).toBe(false);
+	});
+
+	test("round-trips through the store, preview or not", () => {
+		const record = presence({ id: "s-1", activity: "busy", call });
+		writePresence(root, record);
+		expect(readPresence(root, "s-1")).toEqual(record);
+		const bare = presence({ id: "s-2", activity: "busy", call: { id: "c-2", name: "wait_for_ci", since: 9 } });
+		writePresence(root, bare);
+		expect(readPresence(root, "s-2")).toEqual(bare);
+	});
+
+	test("a malformed call is dropped and the record still parses; a long or multi-line preview is clipped to one line", () => {
+		const parsedCall = (value: unknown) => {
+			const result = parsePresence({ ...presence({ id: "s-1" }), call: value });
+			return result.ok ? result.value.call : "invalid";
+		};
+		for (const junk of [null, 42, "bash", [], {}, { ...call, id: "" }, { ...call, name: 7 }, { ...call, since: "5000" }, { id: "c", name: "bash" }]) {
+			expect(parsedCall(junk)).toBeUndefined();
+		}
+		expect(parsedCall({ ...call, preview: 42 })).toEqual({ id: call.id, name: "bash", since: 5_000 });
+		expect(parsedCall({ ...call, preview: "  a\n  b " })).toEqual({ ...call, preview: "a b" });
+		const long = parsedCall({ ...call, preview: "y".repeat(5_000) });
+		expect(typeof long === "object" && long.preview?.length).toBe(120);
 	});
 });
 

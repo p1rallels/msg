@@ -148,6 +148,26 @@ export const toolDetails = (entries: readonly Record<string, unknown>[], tool: s
 		return typeof message.details === "object" && message.details !== null ? [message.details as Record<string, unknown>] : [];
 	});
 
+export interface Proc {
+	readonly pid: number;
+	readonly ppid: number;
+	readonly command: string;
+}
+
+/** Every process on the machine, as ps sees it now. */
+export const processes = (): Proc[] =>
+	new TextDecoder()
+		.decode(Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]).stdout)
+		.split("\n")
+		.flatMap((line) => {
+			const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+			return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" }] : [];
+		});
+
+/** The processes descended from `pid`: its children, theirs, and so on. */
+export const descendantsOf = (pid: number, all: readonly Proc[] = processes()): Proc[] =>
+	all.filter((proc) => proc.ppid === pid && proc.pid !== pid).flatMap((child) => [child, ...descendantsOf(child.pid, all)]);
+
 /** Sends one RPC command to a `--mode rpc` pi. */
 export const rpc = (run: Run, command: Record<string, unknown>): void => {
 	run.proc.stdin.write(`${JSON.stringify(command)}\n`);

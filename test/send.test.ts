@@ -162,10 +162,14 @@ describe("postExit", () => {
 		expect(cut.ok && cut.value.stopped).toBe(true);
 		const died = postExit(root, { id: "k-2" }, "boss-1", { kind: "died", life: { pid: 7, startedAt: 3 } }, "gone", 11);
 		expect(died.ok && [died.value.kind, died.value.life, "stopped" in died.value]).toEqual(["died", { pid: 7, startedAt: 3 }, false]);
-		expect(waiting(root, "boss-1").map((sent) => [sent.kind, sent.stopped ?? false, sent.life?.pid])).toEqual([
-			["ended", false, undefined],
-			["ended", true, undefined],
-			["died", false, 7],
+		const call = { id: "toolu_1", name: "bash", preview: "sleep 613", since: 4 };
+		const stalled = postExit(root, { id: "k-4" }, "boss-1", { kind: "stalled", life: { pid: 8, startedAt: 2 }, call }, "stuck", 12);
+		expect(stalled.ok && [stalled.value.kind, stalled.value.life, stalled.value.call]).toEqual(["stalled", { pid: 8, startedAt: 2 }, call]);
+		expect(waiting(root, "boss-1").map((sent) => [sent.kind, sent.stopped ?? false, sent.life?.pid, sent.call?.id])).toEqual([
+			["ended", false, undefined, undefined],
+			["ended", true, undefined, undefined],
+			["died", false, 7, undefined],
+			["stalled", false, 8, "toolu_1"],
 		]);
 	});
 
@@ -278,11 +282,15 @@ describe("replyText: what a waiting msg_send returns", () => {
 			"kid was stopped before it finished, without replying. Its last message, not a finished report (inspect its work before relying on it):\nhalfway",
 		);
 		expect(replyText({ kind: "message", message: message({ to: "me", from: kid, kind: "died", text: "gone" }) }, "kid", 60)).toBe("kid died before replying: gone");
+		expect(replyText({ kind: "message", message: message({ to: "me", from: kid, kind: "stalled", text: "stuck in bash. To stop it, run `kill 7`" }) }, "kid", 60)).toBe(
+			"kid stalled before replying. A later reply arrives as a normal message.\nstuck in bash. To stop it, run `kill 7`",
+		);
 		expect(replyText({ kind: "timeout" }, "kid", 60)).toContain("No reply from kid within 60s.");
 		expect(replyText({ kind: "aborted" }, "kid", 60)).toContain("Stopped waiting for kid.");
 	});
 
-	test("headline marks ended, stopped and died", () => {
+	test("headline marks ended, stopped, died and stalled", () => {
+		expect(headline(message({ to: "me", from: kid, kind: "stalled" }))).toBe("\u2709 kid stalled");
 		expect(headline(message({ to: "me", from: kid }))).toBe("✉ kid");
 		expect(headline(message({ to: "me", from: kid, kind: "ended" }))).toBe("✉ kid ended");
 		expect(headline(message({ to: "me", from: kid, kind: "ended", stopped: true }))).toBe("✉ kid was stopped before it finished");

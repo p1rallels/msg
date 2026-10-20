@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync } from "node:fs";
-import { DEATH_WINDOW_MS } from "../src/core/lineage.ts";
+import { DEATH_WINDOW_MS, STALLED_AFTER_MS } from "../src/core/lineage.ts";
 import { claim, deliver, ensureMailbox, messagesSince, pending } from "../src/core/maildir.ts";
-import type { Message } from "../src/core/message.ts";
+import type { Call, Message } from "../src/core/message.ts";
 import { type Presence, STALE_AFTER_MS, writePresence } from "../src/core/registry.ts";
 import { type ChildWatch, childrenAfter, filesToRead, lookAfterChildren, newWatch } from "../src/core/watch.ts";
 import { message, presence, tempRoot } from "./helpers.ts";
@@ -166,9 +166,120 @@ describe("deaths are reported once, with the inbox as the evidence", () => {
 		chmodSync(tmp, 0o500);
 		const failed = lookAfterChildren(root, BOSS, newWatch(), "full", now, now, pids(7));
 		chmodSync(tmp, 0o700);
-		expect(failed.failed.map((failure) => failure.death.child.id)).toEqual(["k-1"]);
+		expect(failed.failed.map((failure) => [failure.child.id, failure.kind])).toEqual([["k-1", "died"]]);
 		expect(failed.posted).toEqual([]);
 		expect(lookAfterChildren(root, BOSS, failed.watch, "full", now + 10_000, now, pids(7)).posted.length).toBe(1);
 		expect(diedIn(BOSS).length).toBe(1);
+	});
+});
+
+describe("stalls are reported once per call, with the inbox as the evidence", () => {
+	const stalledIn = (box: string): Message[] => messagesSince(root, box, 0).filter((message) => message.kind === "stalled");
+	const sleeping = (id: string, since: number): Call => ({ id, name: "bash", preview: "sleep 613", since });
+	/** A child whose record, written at `at`, shows `call` running. */
+	const busy = (call: Call | undefined, at = now, overrides: Partial<Presence> = {}): Presence =>
+		kid("k-1", { activity: "busy", startedAt: now - 3_600_000, heartbeatAt: at - 1_000, ...(call ? { call } : {}), ...overrides });
+	const stuck = sleeping("c1", now - STALLED_AFTER_MS - 1);
+	const calls = (look: { readonly posted: readonly Message[] }) => look.posted.map((notice) => notice.call?.id);
+
+	test("a child stuck in one call past the threshold gets one stalled, from it, naming its life and call, with the stop command", () => {
+		writePresence(root, busy(stuck, now, { pid: 4242 }));
+		const look = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive);
+		expect(look.posted.map((notice) => [notice.from.id, notice.to, notice.kind, notice.life, notice.call])).toEqual([
+			["k-1", BOSS, "stalled", { pid: 4242, startedAt: now - 3_600_000 }, stuck],
+		]);
+		expect(look.posted[0]?.text).toContain("bash: sleep 613\n");
+		expect(look.posted[0]?.text).toContain("run `kill 4242`");
+		expect(ids(look.watch.watched)).toEqual(["k-1"]);
+		writePresence(root, busy(stuck, now + 10_000, { pid: 4242 }));
+		expect(lookAfterChildren(root, BOSS, look.watch, "full", now + 10_000, 0, alive).posted).toEqual([]);
+		expect(stalledIn(BOSS).length).toBe(1);
+	});
+
+	test("a quick look doesn't judge a record it didn't reread; the next full look does", () => {
+		writePresence(root, busy(sleeping("c1", now - 5_000)));
+		const start = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive, 8_000);
+		const quick = lookAfterChildren(root, BOSS, start.watch, "quick", now + 4_000, 0, alive, 8_000);
+		expect([start.posted, quick.records, quick.posted]).toEqual([[], [], []]);
+		const full = lookAfterChildren(root, BOSS, quick.watch, "full", now + 6_000, 0, alive, 8_000);
+		expect(calls(full)).toEqual(["c1"]);
+	});
+
+	test("a call that ended between looks isn't judged from the record as last read", () => {
+		writePresence(root, busy(sleeping("c1", now - 5_000)));
+		const start = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive, 8_000);
+		writePresence(root, busy(undefined, now + 3_000));
+		const quick = lookAfterChildren(root, BOSS, start.watch, "quick", now + 4_000, 0, alive, 8_000);
+		const full = lookAfterChildren(root, BOSS, quick.watch, "full", now + 10_000, 0, alive, 8_000);
+		expect([quick.posted, full.posted]).toEqual([[], []]);
+		expect(stalledIn(BOSS)).toEqual([]);
+	});
+
+	test("once per call, even across restarts: its notice in the inbox, new/ or cur/, is the evidence", () => {
+		writePresence(root, busy(stuck));
+		expect(calls(lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive))).toEqual(["c1"]);
+		const restarted = now + 60_000;
+		const judged = restarted + STALLED_AFTER_MS + 1;
+		writePresence(root, busy(stuck, judged));
+		expect(lookAfterChildren(root, BOSS, newWatch(), "full", judged, restarted, alive).posted).toEqual([]);
+		for (const file of pending(root, BOSS)) claim(root, BOSS, file);
+		expect(lookAfterChildren(root, BOSS, newWatch(), "full", judged + 1, restarted, alive).posted).toEqual([]);
+		expect(stalledIn(BOSS).length).toBe(1);
+	});
+
+	test("a parent that just started gives a long-stuck call the threshold again before reporting it", () => {
+		writePresence(root, busy(sleeping("c1", now - 3_600_000)));
+		expect(lookAfterChildren(root, BOSS, newWatch(), "full", now, now, alive).posted).toEqual([]);
+		writePresence(root, busy(sleeping("c1", now - 3_600_000), now + STALLED_AFTER_MS + 1));
+		expect(calls(lookAfterChildren(root, BOSS, newWatch(), "full", now + STALLED_AFTER_MS + 1, now, alive))).toEqual(["c1"]);
+	});
+
+	test("a later stall, on another call, is reported again", () => {
+		writePresence(root, busy(stuck));
+		const first = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive);
+		const later = now + 60_000;
+		const judged = later + STALLED_AFTER_MS + 1;
+		writePresence(root, busy(sleeping("c2", later), judged));
+		const second = lookAfterChildren(root, BOSS, first.watch, "full", judged, 0, alive);
+		expect([calls(first), calls(second)]).toEqual([["c1"], ["c2"]]);
+		expect(lookAfterChildren(root, BOSS, newWatch(), "full", judged + 1, 0, alive).posted).toEqual([]);
+		expect(stalledIn(BOSS).map((notice) => notice.call?.id).sort()).toEqual(["c1", "c2"]);
+	});
+
+	test("a stuck child whose process is gone died: one died, no stalled", () => {
+		writePresence(root, busy(stuck, now, { pid: 7 }));
+		const look = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, pids(7));
+		expect(look.posted.map((notice) => notice.kind)).toEqual(["died"]);
+	});
+
+	test("a death and a stall in one look: both reported, both remembered", () => {
+		writePresence(root, busy(stuck));
+		writePresence(root, kid("k-2", { pid: 7 }));
+		const look = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, pids(7));
+		expect(look.posted.map((notice) => [notice.from.id, notice.kind])).toEqual([
+			["k-2", "died"],
+			["k-1", "stalled"],
+		]);
+		expect(look.watch.notices.map((notice) => notice.kind)).toEqual(["died", "stalled"]);
+		writePresence(root, busy(stuck, now + 10_000));
+		expect(lookAfterChildren(root, BOSS, look.watch, "full", now + 10_000, 0, pids(7)).posted).toEqual([]);
+	});
+
+	test("other sessions' stuck subs and idle children are nobody's stall here", () => {
+		writePresence(root, presence({ id: "nephew", parent: "other", pid: 10, heartbeatAt: now - 1_000, call: stuck }));
+		writePresence(root, kid("k-3", { heartbeatAt: now - 1_000 }));
+		expect(lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive).posted).toEqual([]);
+	});
+
+	test("a stall notice that can't be posted isn't evidence: the next full look tries again", () => {
+		writePresence(root, busy(stuck));
+		const { tmp } = ensureMailbox(root, BOSS);
+		chmodSync(tmp, 0o500);
+		const failed = lookAfterChildren(root, BOSS, newWatch(), "full", now, 0, alive);
+		chmodSync(tmp, 0o700);
+		expect(failed.failed.map((failure) => [failure.child.id, failure.kind])).toEqual([["k-1", "stalled"]]);
+		expect(failed.posted).toEqual([]);
+		expect(calls(lookAfterChildren(root, BOSS, failed.watch, "full", now + 10_000, 0, alive))).toEqual(["c1"]);
+		expect(stalledIn(BOSS).length).toBe(1);
 	});
 });

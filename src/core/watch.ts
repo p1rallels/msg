@@ -1,10 +1,10 @@
-import { type Death, diedText, isNoticeOf, lifeOf, type Watch, watchChildren } from "./lineage.ts";
+import { type Death, diedText, isNoticeOf, isStallNoticeOf, lifeOf, STALLED_AFTER_MS, stalledText, stallsOf, type Watch, watchChildren } from "./lineage.ts";
 import { messagesSince } from "./maildir.ts";
-import type { Message } from "./message.ts";
+import type { Kind, Message } from "./message.ts";
 import { recordFile } from "./paths.ts";
 import { type PidProbe, pidAlive, type Presence, readPresence, readSessions, type Sessions, STALE_AFTER_MS } from "./registry.ts";
 import { fail, type Result } from "./result.ts";
-import { postExit, senderOf } from "./send.ts";
+import { type Exit, postExit, senderOf } from "./send.ts";
 
 /** What a session keeps between looks at its children. */
 export interface ChildWatch {
@@ -12,7 +12,7 @@ export interface ChildWatch {
 	readonly files: ReadonlySet<string>;
 	/** Children that may still die, as last read. A quick look probes their pids instead of reading them. */
 	readonly watched: readonly Presence[];
-	/** `died` notices this session posted or found in its inbox: deaths already reported. */
+	/** `died` and `stalled` notices this session posted or found in its inbox: deaths and stalls already reported. */
 	readonly notices: readonly Message[];
 }
 
@@ -21,12 +21,22 @@ export const newWatch = (): ChildWatch => ({ files: new Set(), watched: [], noti
 /** `full` reads every record (resumed children, the status line); `quick` only what's new or outdated. */
 export type Scope = "full" | "quick";
 
+/** What a parent's own msg reports about its subs into its own inbox. */
+type Notice = Extract<Kind, "died" | "stalled">;
+
+/** A notice that couldn't be posted: about which child, of what, and why. */
+export interface Failure {
+	readonly child: Presence;
+	readonly kind: Notice;
+	readonly error: string;
+}
+
 export interface Look {
 	readonly watch: ChildWatch;
 	/** The records this look read: every one on a full look. */
 	readonly records: readonly Presence[];
 	readonly posted: readonly Message[];
-	readonly failed: readonly { readonly death: Death; readonly error: string }[];
+	readonly failed: readonly Failure[];
 }
 
 /** A watched child's record may have moved on: its process is gone (did it end?) or its heartbeat as last read is stale. */
@@ -55,26 +65,73 @@ const confirm = (root: string, selfId: string, deaths: readonly Death[], notices
 	return watchChildren(fresh, notices, now, awakeSince, probe);
 };
 
-/** The `died` notices in your inbox, new/ and cur/, that could report these deaths: none is sent before the heartbeat it follows. */
-const noticesFor = (root: string, selfId: string, deaths: readonly Death[]): Message[] =>
-	messagesSince(root, selfId, Math.min(...deaths.map((death) => death.child.heartbeatAt))).filter((message) => message.kind === "died");
+/** The notices of `kind` in your inbox, new/ and cur/, that could report something that happened at one of `times`: none is sent before it. */
+const evidence = (root: string, selfId: string, kind: Notice, times: readonly number[]): Message[] =>
+	times.length === 0 ? [] : messagesSince(root, selfId, Math.min(...times)).filter((message) => message.kind === kind);
 
 const byId = (messages: readonly Message[]): Message[] => [...new Map(messages.map((message) => [message.id, message])).values()];
 
-/** Into your own inbox, from the child, naming its life, and never dated before the heartbeat it follows. */
-const postDied = (root: string, selfId: string, death: Death, now: number): Result<Message> => {
+/** Into your own inbox, from the child, never dated before `notBefore` (the moment its evidence is looked up from). */
+const postNotice = (root: string, selfId: string, child: Presence, exit: Exit, text: string, now: number, notBefore: number): Result<Message> => {
 	try {
-		return postExit(root, senderOf(death.child), selfId, { kind: "died", life: lifeOf(death.child) }, diedText(death, now), Math.max(now, death.child.heartbeatAt));
+		return postExit(root, senderOf(child), selfId, exit, text, Math.max(now, notBefore));
 	} catch (error) {
 		return fail(error instanceof Error ? error.message : String(error));
 	}
 };
 
+interface Reported {
+	readonly notices: readonly Message[];
+	readonly posted: readonly Message[];
+	readonly failed: readonly Failure[];
+}
+
+const reported = (notices: readonly Message[], attempts: readonly { readonly child: Presence; readonly kind: Notice; readonly result: Result<Message> }[]): Reported => {
+	const posted = attempts.flatMap(({ result }) => (result.ok ? [result.value] : []));
+	return {
+		notices: [...notices, ...posted],
+		posted,
+		failed: attempts.flatMap(({ child, kind, result }) => (result.ok ? [] : [{ child, kind, error: result.error }])),
+	};
+};
+
+/**
+ * Deaths are confirmed on a fresh record, then checked against your inbox, where the `died` notices are the evidence
+ * a death was reported (none is sent before the heartbeat it follows); the rest are posted there.
+ */
+const reportDeaths = (root: string, selfId: string, judged: Watch, notices: readonly Message[], now: number, awakeSince: number, probe: PidProbe): Reported & { readonly watched: readonly Presence[] } => {
+	if (judged.died.length === 0) return { watched: judged.watched, notices, posted: [], failed: [] };
+	const confirmed = confirm(root, selfId, judged.died, notices, now, awakeSince, probe);
+	const known = byId([...notices, ...evidence(root, selfId, "died", confirmed.died.map((death) => death.child.heartbeatAt))]);
+	const due = confirmed.died.filter((death) => !known.some((notice) => isNoticeOf(notice, death.child)));
+	const attempts = due.map((death) => ({
+		child: death.child,
+		kind: "died" as const,
+		result: postNotice(root, selfId, death.child, { kind: "died", life: lifeOf(death.child) }, diedText(death, now), now, death.child.heartbeatAt),
+	}));
+	return { watched: [...judged.watched, ...confirmed.watched], ...reported(known, attempts) };
+};
+
+/** Stalls are checked against your inbox the same way: `stalled` notices, none sent before the call it's about started. */
+const reportStalls = (root: string, selfId: string, children: readonly Presence[], notices: readonly Message[], now: number, awakeSince: number, stalledAfterMs: number): Reported => {
+	const found = stallsOf(children, notices, now, awakeSince, stalledAfterMs);
+	if (found.length === 0) return { notices, posted: [], failed: [] };
+	const known = byId([...notices, ...evidence(root, selfId, "stalled", found.map((stall) => stall.call.since))]);
+	const due = found.filter((stall) => !known.some((notice) => isStallNoticeOf(notice, stall)));
+	const attempts = due.map((stall) => ({
+		child: stall.child,
+		kind: "stalled" as const,
+		result: postNotice(root, selfId, stall.child, { kind: "stalled", life: lifeOf(stall.child), call: stall.call }, stalledText(stall, now), now, stall.call.since),
+	}));
+	return reported(known, attempts);
+};
+
 /**
  * One look after your children: one readdir of `sessions/`, reading every record (`full`) or only new
- * and outdated ones (`quick`). A death is confirmed on a fresh record, then checked against your inbox,
- * where the `died` notices are the evidence it was reported (by this run or an earlier one, live or
- * not), and the rest are posted there. A post that fails isn't evidence, so the next full look retries.
+ * and outdated ones (`quick`). Deaths and stalls are reported into your own inbox, where their notices
+ * are the evidence they were (by this run or an earlier one, live or not). Stalls are judged only on
+ * records this look read: a watched child a quick look didn't reread may show a call that has ended
+ * since. A post that fails isn't evidence, so the next full look retries.
  */
 export const lookAfterChildren = (
 	root: string,
@@ -84,19 +141,17 @@ export const lookAfterChildren = (
 	now: number,
 	awakeSince: number,
 	probe: PidProbe = pidAlive,
+	stalledAfterMs = STALLED_AFTER_MS,
 ): Look => {
 	const look = readSessions(root, scope === "full" ? () => true : filesToRead(watch, now, probe));
 	const judged = watchChildren(childrenAfter(watch.watched, look, selfId), watch.notices, now, awakeSince, probe);
-	if (judged.died.length === 0) return { watch: { files: look.files, watched: judged.watched, notices: watch.notices }, records: look.records, posted: [], failed: [] };
-	const confirmed = confirm(root, selfId, judged.died, watch.notices, now, awakeSince, probe);
-	const notices = confirmed.died.length === 0 ? watch.notices : byId([...watch.notices, ...noticesFor(root, selfId, confirmed.died)]);
-	const due = confirmed.died.filter((death) => !notices.some((notice) => isNoticeOf(notice, death.child)));
-	const attempts = due.map((death) => ({ death, result: postDied(root, selfId, death, now) }));
-	const posted = attempts.flatMap(({ result }) => (result.ok ? [result.value] : []));
+	const deaths = reportDeaths(root, selfId, judged, watch.notices, now, awakeSince, probe);
+	const read = new Set(look.records.map((record) => record.id));
+	const stalls = reportStalls(root, selfId, judged.watched.filter((child) => read.has(child.id)), deaths.notices, now, awakeSince, stalledAfterMs);
 	return {
-		watch: { files: look.files, watched: [...judged.watched, ...confirmed.watched], notices: [...notices, ...posted] },
+		watch: { files: look.files, watched: deaths.watched, notices: stalls.notices },
 		records: look.records,
-		posted,
-		failed: attempts.flatMap(({ death, result }) => (result.ok ? [] : [{ death, error: result.error }])),
+		posted: [...deaths.posted, ...stalls.posted],
+		failed: [...deaths.failed, ...stalls.failed],
 	};
 };

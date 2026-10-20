@@ -1,7 +1,9 @@
 import { DELIVERED_TTL_MS } from "./housekeeping.ts";
-import { ago, exactLabel, type Life, MAX_TEXT_BYTES, type Message, partyLabel, type Relation, textBytes } from "./message.ts";
+import { ago, type Call, clipPreview, elapsed, exactLabel, type Life, MAX_TEXT_BYTES, type Message, partyLabel, type Relation, textBytes } from "./message.ts";
 import { type Env, isValidId } from "./paths.ts";
 import { type Mode, type PidProbe, pidAlive, type Presence, STALE_AFTER_MS } from "./registry.ts";
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
  * A death is judged only while the child's last heartbeat is younger than this. Its `died` notice is
@@ -10,6 +12,19 @@ import { type Mode, type PidProbe, pidAlive, type Presence, STALE_AFTER_MS } fro
  * coarse file times and clock steps). An older death goes unreported rather than reported again.
  */
 export const DEATH_WINDOW_MS = DELIVERED_TTL_MS - 24 * 60 * 60_000;
+
+/**
+ * A sub is stalled once one tool call has run this long. Subs' longest legit commands take a minute or so; model
+ * silence isn't a tool call and is pi's own to handle (httpIdleTimeoutMs cuts a quiet stream and retries it).
+ */
+export const STALLED_AFTER_MS = 10 * 60_000;
+
+/** The stall threshold: PI_MSG_STALLED_AFTER_MS when it's a positive integer of ms (for tests), else STALLED_AFTER_MS. */
+export const stalledAfter = (env: Env): number => {
+	const raw = env.PI_MSG_STALLED_AFTER_MS?.trim() ?? "";
+	const ms = /^\d+$/.test(raw) ? Number(raw) : 0;
+	return ms > 0 && Number.isSafeInteger(ms) ? ms : STALLED_AFTER_MS;
+};
 
 /**
  * The session whose bash started this process: pi puts PI_SESSION_ID into every bash child's env and
@@ -46,6 +61,47 @@ export type RunState = "none" | "running" | "finished" | "aborted";
 
 /** A session that ends mid-run, or after its last run was aborted (Esc, SIGTERM, an abort), ended without finishing: `stopped`. */
 export const wasStopped = (run: RunState): boolean => run === "running" || run === "aborted";
+
+/** What pi says about a tool call that starts (its `tool_execution_start` event). */
+export interface CallStart {
+	readonly toolCallId: string;
+	readonly toolName: string;
+	readonly args: unknown;
+	/** Set when another tool made this call. */
+	readonly parentToolCallId?: string | undefined;
+}
+
+/**
+ * Whether a call can stall its session: an outer call (a nested one is covered by the call that made it), and not
+ * msg_send (a sub blocked on its parent's answer isn't stuck: its parent is).
+ */
+export const canStall = (start: CallStart): boolean => !start.parentToolCallId && start.toolName !== "msg_send";
+
+const argsText = (args: unknown): string => {
+	if (!isRecord(args)) return "";
+	if (typeof args.command === "string") return args.command;
+	try {
+		return Object.keys(args).length > 0 ? JSON.stringify(args) : "";
+	} catch {
+		return "";
+	}
+};
+
+/** A call's arguments in one short line: bash's command, else the arguments as JSON. */
+export const previewOf = (args: unknown): string | undefined => clipPreview(argsText(args)) || undefined;
+
+/** The calls that can stall a session, oldest first, after one more starts at `now`. A call already there keeps its start. */
+export const callStarted = (calls: readonly Call[], start: CallStart, now: number): readonly Call[] => {
+	if (!canStall(start) || calls.some((call) => call.id === start.toolCallId)) return calls;
+	const preview = previewOf(start.args);
+	return [...calls, { id: start.toolCallId, name: start.toolName, ...(preview ? { preview } : {}), since: now }];
+};
+
+export const callEnded = (calls: readonly Call[], id: string): readonly Call[] => calls.filter((call) => call.id !== id);
+
+/** Of parallel calls, the one that started first: the one a stall is judged by. */
+export const oldestCall = (calls: readonly Call[]): Call | undefined =>
+	calls.reduce<Call | undefined>((oldest, call) => (oldest === undefined || call.since < oldest.since ? call : oldest), undefined);
 
 export const childrenOf = (records: readonly Presence[], id: string): Presence[] => records.filter((record) => record.parent === id);
 
@@ -90,6 +146,21 @@ export const isNoticeOf = (message: Message, child: Presence): boolean =>
 	message.ts >= child.heartbeatAt &&
 	(message.life === undefined || (message.life.pid === child.pid && message.life.startedAt === child.startedAt));
 
+/** A live sub stuck in one tool call: the call its record shows, running past the stall threshold. */
+export interface Stall {
+	readonly child: Presence;
+	readonly call: Call;
+}
+
+/** True when `message` reports this stall: a `stalled` from that child, about that life and that call. */
+export const isStallNoticeOf = (message: Message, stall: Stall): boolean =>
+	message.kind === "stalled" &&
+	message.from.id === stall.child.id &&
+	message.life?.pid === stall.child.pid &&
+	message.life.startedAt === stall.child.startedAt &&
+	message.call?.id === stall.call.id &&
+	message.call.since === stall.call.since;
+
 export interface Watch {
 	/** Children that may still die: live ones, and silent ones still inside their grace. */
 	readonly watched: readonly Presence[];
@@ -129,6 +200,24 @@ export const watchChildren = (
 	};
 };
 
+const stallOf = (child: Presence, now: number, awakeSince: number, stalledAfterMs: number): Stall | undefined => {
+	const { call } = child;
+	if (call === undefined || child.endedAt !== undefined || now - call.since >= DEATH_WINDOW_MS) return undefined;
+	return now - Math.max(call.since, awakeSince) > stalledAfterMs ? { child, call } : undefined;
+};
+
+/**
+ * The stalls among live children, as just read: a child whose oldest call (its record's `call`) has run longer than
+ * `stalledAfterMs` of time you were awake too (after a sleep, or when you start, `awakeSince` restarts the clock, so
+ * a machine that slept doesn't stall a call), and isn't reported in `notices` yet: once per call. A call older than
+ * DEATH_WINDOW_MS is let be, as its notice may be pruned.
+ */
+export const stallsOf = (children: readonly Presence[], notices: readonly Message[], now: number, awakeSince: number, stalledAfterMs = STALLED_AFTER_MS): Stall[] =>
+	children.flatMap((child) => {
+		const stall = stallOf(child, now, awakeSince, stalledAfterMs);
+		return stall === undefined || notices.some((notice) => isStallNoticeOf(notice, stall)) ? [] : [stall];
+	});
+
 export const diedText = (death: Death, now: number): string => {
 	const { child } = death;
 	const who = partyLabel(child);
@@ -140,7 +229,26 @@ export const diedText = (death: Death, now: number): string => {
 	}
 };
 
-const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+/**
+ * What stops a stalled sub, stuck command and all: SIGTERM to its pi, which kills every command it runs (each
+ * leads its own process group, and pi kills the group) and ends, reporting `ended`, stopped.
+ */
+export const stopCommand = (child: Pick<Presence, "pid">): string => `kill ${child.pid}`;
+
+const utc = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/** A stall's message text: what the sub is stuck in, for how long and since when, that it's alive, and how to stop it or leave it. */
+export const stalledText = (stall: Stall, now: number): string => {
+	const { child, call } = stall;
+	const who = partyLabel(child);
+	return [
+		`${who} has been stuck in one tool call for ${elapsed(call.since, now)}, since ${utc(call.since)}:`,
+		call.preview === undefined ? call.name : `${call.name}: ${call.preview}`,
+		`It's alive (pid ${child.pid}, last heartbeat ${ago(child.heartbeatAt, now)}) but can't go on until that call returns.`,
+		`To stop it, run \`${stopCommand(child)}\`: pi kills the commands it's running (each one's whole process group) and ends, and ${who} reports ended, stopped, with its last words.`,
+		"Or leave it, if that's a legit long command: you won't hear about this call again.",
+	].join("\n");
+};
 
 /**
  * What a session last said: its newest assistant text, and the error of its newest assistant message when that one

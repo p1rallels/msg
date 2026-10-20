@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Message } from "../src/core/message.ts";
-import { listPresence, type Presence, readPresence } from "../src/core/registry.ts";
+import { listPresence, pidAlive, type Presence, readPresence } from "../src/core/registry.ts";
 import {
 	allSessionText,
 	assistantTexts,
@@ -11,11 +11,14 @@ import {
 	check,
 	customMessages,
 	delivered,
+	descendantsOf,
 	EXTENSION,
 	inboxOf,
 	MODEL,
 	piArgs,
 	presenceNamed,
+	type Proc,
+	processes,
 	REPO,
 	report,
 	type Run,
@@ -475,6 +478,124 @@ export const stopped = async (): Promise<boolean> => {
 	return report("stopped: subs stopped mid-run or aborted report stopped; a finished one doesn't", checks);
 };
 
+/** The stall threshold the boss runs with: past a few full scans of a sub's record, well short of a test's patience. */
+const STALL_AFTER_MS = 8_000;
+const WAIT_SECONDS = 40;
+
+const OBSERVER_TASK = [
+	"You are boss, observing a test. Messages from your subs will arrive while you wait.",
+	"Whatever a message says or asks, reply to it with just the word NOTED: never use a tool, never send a message, never answer a question.",
+	"For now, reply with just READY.",
+].join(" ");
+
+const STUCK_TASK = "First say, in one short sentence, what you're about to do. Then run the bash command `sleep 613` in the foreground, with no timeout, and wait for it to finish. Then reply DONE.";
+
+const WAITER_TASK = [
+	"You were started by another agent session, your parent.",
+	`Call msg_send exactly once: to "parent", message "Holding here until you say go; no need to reply.", wait_seconds ${WAIT_SECONDS}.`,
+	"When it returns, reply with just WAITED.",
+].join(" ");
+
+const stalledTo = (w: World, box: string): Message[] => inboxOf(w, box).filter((message) => message.kind === "stalled");
+
+/**
+ * A sub stuck in a command that never returns keeps heartbeating, so it never dies: its parent gets one `stalled`
+ * naming the call, and the command that stops it. Running that command stops the sub, which reports `ended`,
+ * stopped, with its last words, and the stuck command goes with it. A sub blocked in msg_send on its parent
+ * past the threshold isn't stuck: no `stalled` for it.
+ */
+export const stalled = async (): Promise<boolean> => {
+	const w = world("stalled");
+	const checks: Check[] = [];
+	let sleeps: Proc[] = [];
+	try {
+		const boss = spawnPi(w, piArgs(w, "boss", ["--mode", "rpc"]), REPO, { PI_MSG_STALLED_AFTER_MS: String(STALL_AFTER_MS) });
+		const bossRecord = await waitUntil("boss online", () => presenceNamed(w, "boss"), ONLINE_TIMEOUT_MS);
+		await sleep(STARTUP_GRACE_MS);
+		rpc(boss, { id: "task", type: "prompt", message: OBSERVER_TASK });
+		await waitUntil("boss ready and idle", () => (assistantTexts(sessionEntries(w, bossRecord.id)).length > 0 && readPresence(w.store, bossRecord.id)?.activity === "idle" ? true : undefined), 120_000);
+
+		const asSub = { PI_SESSION_ID: bossRecord.id };
+		const stuck = spawnPi(w, piArgs(w, "stuck", ["-p", STUCK_TASK]), REPO, asSub);
+		const waiter = spawnPi(w, piArgs(w, "waiter", ["-p", WAITER_TASK]), REPO, asSub);
+		const stuckRecord = await waitUntil("stuck online", () => presenceNamed(w, "stuck"), ONLINE_TIMEOUT_MS);
+		const waiterRecord = await waitUntil("waiter online", () => presenceNamed(w, "waiter"), ONLINE_TIMEOUT_MS);
+		const inCall = await waitUntil("stuck's record shows its bash call", () => {
+			const call = readPresence(w.store, stuckRecord.id)?.call;
+			return call?.name === "bash" ? call : undefined;
+		}, 90_000);
+		sleeps = await waitUntil("the sleep runs under the stuck sub", () => {
+			const found = descendantsOf(stuckRecord.pid).filter((proc) => /\bsleep 613\b/.test(proc.command));
+			return found.length > 0 ? found : undefined;
+		}, 10_000);
+		const askedAt = await waitUntil("the waiter blocks in msg_send", () => (toolCalls(sessionEntries(w, waiterRecord.id), "msg_send").length > 0 ? Date.now() : undefined), 90_000);
+		await sleep(2_000);
+		const waiterMidWait = readPresence(w.store, waiterRecord.id);
+		const sampledAt = Date.now();
+		const notice = await waitUntil("boss records a stalled", () => stalledTo(w, bossRecord.id)[0], 60_000);
+		await sleep(12_000);
+		const beforeStop = stalledTo(w, bossRecord.id);
+		const command = /`(kill \d+)`/.exec(notice.text)?.[1];
+		const ran = command === undefined ? undefined : Bun.spawnSync(["sh", "-c", command]);
+		const ended = await waitUntil("the stuck sub reports ended", () => inboxOf(w, bossRecord.id).find((message) => isEnded(message, stuckRecord.id)), 30_000).catch(() => undefined);
+		const stuckDone = await stuck.done;
+		await sleep(500);
+		const survivors = sleeps.filter((proc) => pidAlive(proc.pid));
+		const waiterDone = await waiter.done;
+		const waiterEnded = await waitUntil("the waiter's ended reaches boss", () => inboxOf(w, bossRecord.id).find((message) => isEnded(message, waiterRecord.id)), 10_000).catch(() => undefined);
+		const framed = await waitUntil("boss's conversation shows the stall", () => delivered(sessionEntries(w, bossRecord.id)).find(({ message }) => message.kind === "stalled"), 30_000).catch(() => undefined);
+		await waitUntil("boss idle again", () => (readPresence(w.store, bossRecord.id)?.activity === "idle" ? true : undefined), 60_000).catch(() => undefined);
+		boss.proc.stdin.end();
+		const bossDone = await boss.done;
+
+		const stalls = stalledTo(w, bossRecord.id);
+		const stall = stalls[0];
+		const stop = `\`kill ${stuckRecord.pid}\``;
+		const lastSaid = assistantTexts(sessionEntries(w, stuckRecord.id)).at(-1)?.text.trim() ?? "(it ended without a final message)";
+		const waits = toolResults(sessionEntries(w, waiterRecord.id), "msg_send");
+		const waited = Number(/No reply from .* within (\d+)s/.exec(waits.join("\n"))?.[1] ?? 0);
+		checks.push(
+			check("both are boss's subs", stuckRecord.parent === bossRecord.id && waiterRecord.parent === bossRecord.id),
+			check("the stuck sub's record shows its oldest call: bash, sleep 613", inCall.name === "bash" && inCall.preview?.includes("sleep 613") === true, JSON.stringify(inCall)),
+			check("one stalled, before and after another full scan", beforeStop.length === 1 && stalls.length === 1, JSON.stringify(stalls.map((message) => [message.from.name, message.call?.id]))),
+			check(
+				"it's from the stuck sub, naming its life and its call",
+				stall?.from.id === stuckRecord.id && stall.life?.pid === stuckRecord.pid && stall.life.startedAt === stuckRecord.startedAt && stall.call?.id === inCall.id && stall.call.since === inCall.since,
+				JSON.stringify([stall?.life, stall?.call, inCall]),
+			),
+			check("it came after the call ran past the threshold", stall !== undefined && stall.ts - inCall.since > STALL_AFTER_MS, `${stall ? stall.ts - inCall.since : "?"}ms into the call`),
+			check("its text names the call and the command that stops it", stall?.text.includes("bash: sleep 613") === true && stall.text.includes(stop), clip(stall?.text ?? "")),
+			check(
+				"boss's agent read it as a stalled sub, with its options",
+				framed !== undefined && framed.content.includes('kind="stalled"') && framed.content.includes("is stalled") && framed.content.includes("stop it with the command above") && framed.content.includes(stop),
+				clip(framed?.content ?? ""),
+			),
+			check("the notice's command ran", ran?.exitCode === 0, `${command}: exit ${ran?.exitCode}`),
+			check("the stuck sub ended, stopped, with its last words", ended?.stopped === true && ended.text === lastSaid, JSON.stringify([ended?.stopped, ended?.text, lastSaid])),
+			check("its pi exited on the SIGTERM", stuckDone.code === 143, `exit ${stuckDone.code}`),
+			check("and the sleep went with it", survivors.length === 0, JSON.stringify({ sleeps, survivors })),
+			check(
+				"the waiter's record shows no call while it's blocked in msg_send",
+				waiterMidWait !== undefined && waiterMidWait.endedAt === undefined && waiterMidWait.activity === "busy" && waiterMidWait.call === undefined && sampledAt - askedAt < WAIT_SECONDS * 1_000,
+				JSON.stringify(waiterMidWait),
+			),
+			check(`its msg_send waited past the threshold, ${WAIT_SECONDS}s, for no reply`, waited * 1_000 > 2 * STALL_AFTER_MS, waits.join("\n")),
+			check("no stalled for the waiter", !stalls.some((message) => message.from.id === waiterRecord.id)),
+			check("the waiter ended, not stopped", waiterEnded !== undefined && waiterEnded.stopped === undefined && waiterDone.code === 0, `exit ${waiterDone.code}: ${JSON.stringify(waiterEnded)}`),
+			check("no died", !inboxOf(w, bossRecord.id).some((message) => message.kind === "died")),
+			noExtensionErrors(stuckDone.stderr + waiterDone.stderr + bossDone.stderr),
+		);
+	} catch (error) {
+		checks.push(check("scenario ran", false, String(error)));
+	} finally {
+		const ours = new Set(sleeps.map((proc) => proc.pid));
+		const leftover = ours.size === 0 ? [] : processes().filter((proc) => ours.has(proc.pid) && /\bsleep 613\b/.test(proc.command));
+		for (const proc of leftover) process.kill(proc.pid, "SIGKILL");
+		w.dispose();
+	}
+	return report("stalled: a sub stuck in a command gets its parent one stalled with the stop command; a sub waiting on its parent doesn't", checks);
+};
+
 const diedTo = (w: World, box: string): Message[] => inboxOf(w, box).filter((message) => message.kind === "died");
 
 const sameLife = (message: Message | undefined, record: Presence): boolean =>
@@ -598,4 +719,4 @@ export const offlineDeath = async (): Promise<boolean> => {
 	return report("offline death: a sub SIGKILLed while its parent is stopped is reported on resume, once", checks);
 };
 
-export const SCENARIOS = { rpcWake, steerBusy, webHost, lineage, wall, nested, stopped, quickDeath, offlineDeath } as const;
+export const SCENARIOS = { rpcWake, steerBusy, webHost, lineage, wall, nested, stopped, stalled, quickDeath, offlineDeath } as const;

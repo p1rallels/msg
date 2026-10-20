@@ -117,6 +117,24 @@ describe("parseMessage", () => {
 		expect("life" in message({ to: "b-1" })).toBe(false);
 	});
 
+	test("a stalled notice's life and call round-trip; a call is only ever said of a stalled", () => {
+		const call = { id: "toolu_01Abc", name: "bash", preview: "sleep 613", since: 1_000 };
+		const stalled = message({ to: "b-1", kind: "stalled", life: { pid: 7, startedAt: 500 }, call });
+		expect([stalled.kind, stalled.life, stalled.call]).toEqual(["stalled", { pid: 7, startedAt: 500 }, call]);
+		expect(parseMessage(JSON.parse(JSON.stringify(stalled)))).toEqual({ ok: true, value: stalled });
+		const died = parseMessage({ ...message({ to: "b-1", kind: "died" }), call });
+		expect(died.ok && "call" in died.value).toBe(false);
+		expect("call" in message({ to: "b-1", kind: "ended", call })).toBe(false);
+		expect("call" in message({ to: "b-1", call })).toBe(false);
+		const junk = parseMessage({ ...stalled, call: { id: "c", name: "bash" } });
+		expect(junk.ok && [junk.value.kind, "call" in junk.value]).toEqual(["stalled", false]);
+	});
+
+	test("a stalled from a future msg with fields this one doesn't know still parses", () => {
+		const stalled = { ...message({ to: "b-1", kind: "stalled" }), severity: "high", call: { id: "c", name: "bash", since: 1, pgid: 9 } };
+		const parsed = parseMessage(stalled);
+		expect(parsed.ok && [parsed.value.kind, parsed.value.call]).toEqual(["stalled", { id: "c", name: "bash", since: 1 }]);
+	});
 });
 
 describe("renderForAgent", () => {
@@ -166,6 +184,18 @@ describe("renderForAgent", () => {
 			"Your sub kid was stopped before it finished (it went away mid-run, or its last run was aborted): above is its last message, not a finished report. Inspect its work in /repo/.forks/3 before relying on it",
 		);
 		expect(rendered).not.toContain("its report.");
+	});
+
+	test("stalled: alive but stuck, can't answer; the options are to wait, look, or stop it with the command above", () => {
+		const from = { id: "k-1", name: "kid", cwd: "/repo/.forks/3" };
+		const call = { id: "toolu_1", name: "bash", preview: "sleep 613", since: 1 };
+		const rendered = renderForAgent(message({ to: "b-1", kind: "stalled", text: "kid has been stuck… To stop it, run `kill 7`.", from, life: { pid: 7, startedAt: 1 }, call }), 0, "child");
+		expect(rendered).toContain('kind="stalled">');
+		expect(rendered).toContain("To stop it, run `kill 7`.");
+		expect(rendered).toContain(
+			"Your sub kid is stalled: alive, but stuck in the tool call above, so it can't go on, answer or report until that call returns. msg won't stop it, and won't tell you about this call again. Your call: wait if that's a legit long command (its report still wakes you), `lookup catchup k-1` to see what it's doing, or stop it with the command above.",
+		);
+		expect(rendered).not.toContain("msg_send");
 	});
 
 	test("escapes attributes and a closing tag inside the body", () => {

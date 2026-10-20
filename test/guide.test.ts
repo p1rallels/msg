@@ -24,12 +24,17 @@ describe("guidelines per role, in every session's prompt", () => {
 
 	test("a parent: woken by its subs, ends its turn instead of polling, answers with reply_to, reads reports in full, lookup for more", () => {
 		const parent = bullet("are your subs");
-		expect(parent).toContain('reports (kind="ended") and deaths (kind="died") wake you');
+		expect(parent).toContain('reports (kind="ended"), deaths (kind="died") and stalls (kind="stalled") wake you');
 		expect(parent).toContain("end your turn to wait");
 		expect(parent).toContain("never poll");
 		expect(parent).toContain("reply_to");
 		expect(parent).toContain("Read each report in full");
 		expect(parent).toContain("`lookup`");
+	});
+
+	test("a parent: a stalled sub is alive; wait, lookup it, or stop it with the notice's command", () => {
+		const parent = bullet("are your subs");
+		expect(parent).toContain("A stalled sub is alive but stuck in one tool call: wait if that's a legit long command, `lookup` its session, or stop it with the notice's command.");
 	});
 
 	test("a top-level session: exact id, or a live folder or name; someone else's sub only through its parent", () => {

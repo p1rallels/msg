@@ -63,7 +63,7 @@ export const createWaiters = (): Waiters => {
 	return { wait, offer, size: () => entries.length, cancelAll };
 };
 
-/** A reply to `sent`: from its recipient, and either pointing at it or not pointing anywhere. Its `ended` or `died` too. */
+/** A reply to `sent`: from its recipient, and either pointing at it or not pointing anywhere. Its `ended`, `died` or `stalled` too. */
 export const isReplyTo =
 	(sent: Pick<Message, "id" | "to">): MessageMatch =>
 	(message) =>

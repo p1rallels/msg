@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { childrenOf } from "./lineage.ts";
 import { deliver } from "./maildir.ts";
-import { createMessage, exactLabel, type Life, type Message, partyLabel, type Sender } from "./message.ts";
+import { type Call, createMessage, exactLabel, type Life, type Message, partyLabel, type Sender } from "./message.ts";
 import { canonicalPath } from "./paths.ts";
 import { type Directory, directory, listPresence, type PidProbe, pidAlive, type Presence } from "./registry.ts";
 import { type Asker, cleanQuery, folderOf, isChildren, type Lookup, resolveTarget, type Target } from "./resolve.ts";
@@ -106,10 +106,13 @@ export const post = (root: string, from: Sender, target: Target, outgoing: Outgo
 	return ok(created.value);
 };
 
-/** An exit notice: `ended` (stopped or not) from a sub to its parent, `died` naming the life that died. */
-export type Exit = { readonly kind: "ended"; readonly stopped: boolean } | { readonly kind: "died"; readonly life: Life };
+/** A notice about a sub: `ended` (stopped or not), `died` naming the life that died, `stalled` naming the life and the stuck call. */
+export type Exit =
+	| { readonly kind: "ended"; readonly stopped: boolean }
+	| { readonly kind: "died"; readonly life: Life }
+	| { readonly kind: "stalled"; readonly life: Life; readonly call: Call };
 
-/** Drops an exit notice: `ended` goes from a sub to its parent, `died` into the parent's own inbox `from` the sub. */
+/** Drops a notice: `ended` goes from a sub to its parent, `died` and `stalled` into the parent's own inbox `from` the sub. */
 export const postExit = (root: string, from: Sender, to: string, exit: Exit, text: string, now: number): Result<Message> => {
 	const created = createMessage({ from, to, text, ...exit }, now);
 	if (!created.ok) return created;

@@ -27,6 +27,7 @@ export const message = (draft: Partial<Draft> & { to: string }, now = 1_700_000_
 				...(draft.kind ? { kind: draft.kind } : {}),
 				...(draft.stopped ? { stopped: true } : {}),
 				...(draft.life ? { life: draft.life } : {}),
+				...(draft.call ? { call: draft.call } : {}),
 			},
 			now,
 			fixedRandom,

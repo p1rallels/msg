@@ -1,7 +1,7 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { listJsonFiles, parseJson, readTextOrUndefined, writeFileAtomic } from "./fsx.ts";
-import { normalizeName } from "./message.ts";
+import { type Call, normalizeName, parseCall } from "./message.ts";
 import { isValidId, presencePath, recordFile, sessionsDir } from "./paths.ts";
 import { fail, ok, type Result } from "./result.ts";
 
@@ -27,6 +27,8 @@ export interface Presence {
 	readonly startedAt: number;
 	readonly heartbeatAt: number;
 	readonly endedAt?: number;
+	/** The oldest tool call the session is running that can stall it (not msg_send, not a nested call): its parent judges stalls by it. */
+	readonly call?: Call;
 }
 
 const MODES: readonly Mode[] = ["tui", "rpc", "json", "print", "web", "cli"];
@@ -52,6 +54,7 @@ export const parsePresence = (value: unknown): Result<Presence> => {
 	const name = normalizeName(typeof value.name === "string" ? value.name : undefined);
 	const parent = typeof value.parent === "string" && isValidId(value.parent) && value.parent !== id ? value.parent : undefined;
 	const endedAt = finite(value.endedAt);
+	const call = parseCall(value.call);
 	return ok({
 		v: PRESENCE_VERSION,
 		id,
@@ -64,6 +67,7 @@ export const parsePresence = (value: unknown): Result<Presence> => {
 		startedAt,
 		heartbeatAt,
 		...(endedAt !== undefined ? { endedAt } : {}),
+		...(call ? { call } : {}),
 	});
 };
 

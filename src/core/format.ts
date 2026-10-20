@@ -131,7 +131,7 @@ export const targetLabel = (target: Target): string => {
 	return `${target.via === "parent" ? "your parent" : "(unknown)"} (${target.id})`;
 };
 
-/** What msg_send returns after waiting on `who`: its reply, its report or death instead, or nothing in time. */
+/** What msg_send returns after waiting on `who`: its reply, its report, death or stall instead, or nothing in time. */
 export const replyText = (outcome: WaitOutcome, who: string, seconds: number): string => {
 	switch (outcome.kind) {
 		case "message": {
@@ -141,6 +141,7 @@ export const replyText = (outcome: WaitOutcome, who: string, seconds: number): s
 			}
 			if (message.kind === "ended") return `${who} ended before replying. Its final message:\n${message.text}`;
 			if (message.kind === "died") return `${who} died before replying: ${message.text}`;
+			if (message.kind === "stalled") return `${who} stalled before replying. A later reply arrives as a normal message.\n${message.text}`;
 			return `${who} replied (${message.id}):\n${message.text}`;
 		}
 		case "timeout":
@@ -155,5 +156,6 @@ export const headline = (message: Message): string => {
 	const who = partyLabel(message.from);
 	if (message.kind === "ended") return message.stopped ? `✉ ${who} was stopped before it finished` : `✉ ${who} ended`;
 	if (message.kind === "died") return `✉ ${who} died`;
+	if (message.kind === "stalled") return `✉ ${who} stalled`;
 	return `✉ ${who}`;
 };
