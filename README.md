@@ -64,10 +64,16 @@ is who started this process. A session with no parent is **top-level**.
   is pi's to handle (`httpIdleTimeoutMs` retries a quiet stream), streaming output isn't progress, a
   `msg_send` waiting on the parent isn't stuck (its parent is), and a nested call counts through the call
   that made it. The notice says what the sub is stuck in (`bash: npm run dev`), for how long and since
-  when, that it's alive (pid, last heartbeat), and the command that stops it, `kill <pid>`: pi kills the
-  commands it's running, each one's whole process group, so a foreground server frees its port, and the
-  sub reports `ended`, stopped, with its last words. msg never runs it: the parent waits (a legit long
-  command), `lookup`s the sub, or stops it
+  when, that it's alive (pid, last heartbeat), and the commands that stop it. For a bash call, first the
+  command's own, `kill -- -<pgid>`: as it posts the notice, msg looks up the call's process group once
+  (pi spawns each bash command `detached`, so the call's shell is a direct child of the sub's pi that
+  leads its own group, started with the call) and names it only when exactly one process matches. That
+  SIGTERMs the group pi's own timeout would SIGKILL: the call comes back failed and the sub carries on
+  with its context, and a message sent just before reaches it as soon as the call returns, before its
+  next step, to say what to do instead. Then the whole sub's, `kill <pid>`: pi kills the commands it's
+  running, each one's whole process group, so a foreground server frees its port, and the sub reports
+  `ended`, stopped, with its last words. msg never runs either: the parent waits (a legit long command),
+  `lookup`s the sub, or stops the command or the sub
 - **bash timeouts**: a sub's `bash` calls that set no `timeout` get 5 minutes. Nobody watches a sub's
   terminal, so a command that never returns (a dev server in the foreground, `tail -f`, a prompt waiting
   on stdin, a network call that never answers) would hold the sub until its parent hears it stalled, and
@@ -94,8 +100,8 @@ The tool guidelines ship in every session's prompt, by role:
   your report
 - **a parent**: your subs' questions, reports, deaths and stalls wake you, so end your turn to wait (never
   poll or sleep); answer a question with `reply_to`; read each report in full; `lookup` a sub's session for
-  more; a stalled sub is alive: wait if its command is a legit long one, `lookup` it, or stop it with the
-  notice's command
+  more; a stalled sub is alive: wait if its command is a legit long one, `lookup` it, or stop just that
+  command (`msg_send` it what to do instead first) or the whole sub, with the notice's commands
 - **top-level**: message others by exact session id, or by a folder or name with exactly one live
   session; someone else's sub only through its parent
 
@@ -155,8 +161,24 @@ Your sub scout was stopped before it finished (it went away mid-run, or its last
 ```
 
 A `died` notice says the sub's process is gone, it left no report, and to check its work in its folder.
-A `stalled` notice names the call the sub is stuck in (`bash: npm run dev`), for how long, its pid and
-`kill <pid>`, and lists the parent's options: wait, `lookup` the sub, or stop it.
+A `stalled` notice names the call the sub is stuck in, for how long, the commands that stop just that
+call (when msg found its process group) or the whole sub, and lists the parent's options:
+
+```
+<msg id="0mvg1zo69-2a1ee8" from="scout" session="01a13e47-…" cwd="/Users/…/.pfs/forks/repo/1" kind="stalled">
+scout has been stuck in one tool call for 12m, since 2026-10-20T02:17:33Z:
+bash: npm run dev
+It's alive (pid 18353, last heartbeat 2s ago) but can't go on until that call returns.
+To stop just that command, run `kill -- -18357` (its process group): the call comes back failed and scout carries on, context intact. To tell it what to do instead, msg_send it first: a busy sub reads your message as soon as its running calls return, before its next step.
+To stop scout itself, run `kill 18353`: pi kills the commands it's running (each one's whole process group) and ends, and scout reports ended, stopped, with its last words.
+Or leave it, if that's a legit long command: you won't hear about this call again.
+</msg>
+Your sub scout is stalled: alive, but stuck in the tool call above, so it can't go on, answer or report until that call returns. msg won't stop it, and won't tell you about this call again. Your call: wait if that's a legit long command (its report still wakes you), `lookup catchup 01a13e47-…` to see what it's doing, or stop it with a command above: just the stuck command (msg_send it what to do instead first), or the whole sub.
+```
+
+Without a group line (not exactly one match, `ps` failed or took over 2s, a call that isn't bash) the
+notice says ``To stop it, run `kill <pid>` `` and the last line ends `or stop it with the command above`.
+
 A message from a session that's neither your parent nor your sub reads "Message from another agent
 session (not your user)". Peer messages are never delivered as user messages: in pi and lookup, `user`
 means what a human typed.
@@ -229,9 +251,12 @@ Message ids are time-sortable (`0mv962x7b-67ef02`: base36 ms + random), so `ls n
   is its memory of what it reported (a `died` names the sub's pid and start), and delivered messages go
   after 7 days, so a death over 6 days old by then is never reported. A sub killed between posting
   `ended` and marking itself ended (microseconds) reports both
-- **stalls**: `kill <pid>` takes down everything the stuck command runs in its process group, but a
-  process it moved into a session of its own (`setsid`, a detached spawn, a daemon) outlives it and keeps
-  its port: find it with `lsof -nP -iTCP:<port> -sTCP:LISTEN`. A stall is judged on the parent's 10s full
+- **stalls**: `kill -- -<pgid>` and `kill <pid>` take down everything the stuck command runs in its
+  process group, but a process it moved into a session of its own (`setsid`, a detached spawn, a daemon)
+  outlives it and keeps its port: find it with `lsof -nP -iTCP:<port> -sTCP:LISTEN`. A notice's commands
+  are as of when it was posted: a parent normally acts within seconds of the wake, but one that reads
+  the notice much later may name a group that has ended, or whose number has gone to another group
+  since, so check it first (`pgrep -lg <pgid>`). A stall is judged on the parent's 10s full
   scan and counts only time the parent was awake too, so a parent that just started or woke from sleep
   gives a stuck call 10 more minutes before it tells. A legit command over 10 minutes gets its one notice too
 - **parents are interactive**: a parent waits by ending its turn, so it has to be a session that wakes
@@ -256,7 +281,8 @@ pfs run "$n" --bg -q pi -n api-builder -p "$task"   # its parent is you: pi's ba
 Then the parent ends its turn. A sub's question wakes it: answer with `msg_send` + `reply_to`. A sub's
 `ended` report wakes it: read it in full, then review and merge (a `stopped` one: inspect its fork
 first), and `lookup` the sub's session for more. A `died` wakes it too: look into that fork. So does a
-`stalled`: wait if the command is a legit long one, `lookup` the sub, or run the notice's `kill <pid>`.
+`stalled`: wait if the command is a legit long one, `lookup` the sub, or stop just the command with the
+notice's `kill -- -<pgid>` (after a `msg_send` saying what to do instead) or the whole sub with its `kill <pid>`.
 `msg_send to: "$(pfs path $n)"` reaches the sub while it runs; `to: "children"` tells them all.
 
 The subs need nothing in their task: the guidelines already tell them to ask `parent` with
@@ -277,9 +303,12 @@ bun run e2e     # real pi sessions on anthropic/claude-haiku-5-5 (E2E_MODEL to c
                 # mid-run and an aborted rpc run report stopped, with their last words; a finished pi -p
                 # isn't stopped), quick death
                 # (SIGKILL a second in → one died, SIGTERM → ended), offline death (killed while the parent
-                # is stopped → one died on resume, none on the next), stalled (a sub stuck in `sleep 613` →
-                # one stalled naming the call and `kill <pid>`; running it → ended, stopped, and the sleep
-                # is gone; a sub blocked in msg_send past the threshold → none), timeout (a 3s default:
+                # is stopped → one died on resume, none on the next), stalled (two subs stuck in `sleep 613`
+                # → one stalled each, naming the call, `kill -- -<pgid>` with the group its sleep runs in, and
+                # `kill <pid>`; a message to one, then its group's kill → the sleep is gone, the call fails, the
+                # sub reads the message before its next step and ends as told, not stopped; the other's
+                # `kill <pid>` → ended, stopped, and its sleep is gone; a sub blocked in msg_send past the
+                # threshold → none), timeout (a 3s default:
                 # a sub's `sleep 617` with no timeout → killed at it, with msg's note, and the sub carries on,
                 # finishes and reports, not stopped; `sleep 4` with its own timeout 20 finishes; the
                 # parent's own `sleep 5` gets no default)

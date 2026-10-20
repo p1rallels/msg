@@ -151,17 +151,19 @@ export const toolDetails = (entries: readonly Record<string, unknown>[], tool: s
 export interface Proc {
 	readonly pid: number;
 	readonly ppid: number;
+	/** Its process group: what `kill -- -<pgid>` signals. */
+	readonly pgid: number;
 	readonly command: string;
 }
 
 /** Every process on the machine, as ps sees it now. */
 export const processes = (): Proc[] =>
 	new TextDecoder()
-		.decode(Bun.spawnSync(["ps", "-axo", "pid=,ppid=,command="]).stdout)
+		.decode(Bun.spawnSync(["ps", "-axo", "pid=,ppid=,pgid=,command="]).stdout)
 		.split("\n")
 		.flatMap((line) => {
-			const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-			return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" }] : [];
+			const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+			return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), command: match[4] ?? "" }] : [];
 		});
 
 /** The processes descended from `pid`: its children, theirs, and so on. */

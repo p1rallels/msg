@@ -1,4 +1,5 @@
-import { type Death, diedText, isNoticeOf, isStallNoticeOf, lifeOf, STALLED_AFTER_MS, stalledText, stallsOf, type Watch, watchChildren } from "./lineage.ts";
+import { callGroup, type ProcessTable, type ProcRow, psTable } from "./group.ts";
+import { type Death, diedText, isNoticeOf, isStallNoticeOf, lifeOf, type Stall, STALLED_AFTER_MS, stalledText, stallsOf, type Watch, watchChildren } from "./lineage.ts";
 import { messagesSince } from "./maildir.ts";
 import type { Kind, Message } from "./message.ts";
 import { recordFile } from "./paths.ts";
@@ -112,16 +113,36 @@ const reportDeaths = (root: string, selfId: string, judged: Watch, notices: read
 	return { watched: [...judged.watched, ...confirmed.watched], ...reported(known, attempts) };
 };
 
-/** Stalls are checked against your inbox the same way: `stalled` notices, none sent before the call it's about started. */
-const reportStalls = (root: string, selfId: string, children: readonly Presence[], notices: readonly Message[], now: number, awakeSince: number, stalledAfterMs: number): Reported => {
+/** Only a bash call has a process group to look up: pi spawns each bash command as a group of its own. */
+const inBash = (stall: Stall): boolean => stall.call.name === "bash";
+
+const groupOf = (stall: Stall, procs: readonly ProcRow[] | undefined, now: number): number | undefined =>
+	procs === undefined || !inBash(stall) ? undefined : callGroup(procs, stall.child.pid, stall.call.since, now);
+
+/**
+ * Stalls are checked against your inbox the same way: `stalled` notices, none sent before the call it's about started.
+ * The machine's processes are listed once, and only when a stall about to be reported is on a bash call, so its notice
+ * can name the command's process group.
+ */
+const reportStalls = (
+	root: string,
+	selfId: string,
+	children: readonly Presence[],
+	notices: readonly Message[],
+	now: number,
+	awakeSince: number,
+	stalledAfterMs: number,
+	table: ProcessTable,
+): Reported => {
 	const found = stallsOf(children, notices, now, awakeSince, stalledAfterMs);
 	if (found.length === 0) return { notices, posted: [], failed: [] };
 	const known = byId([...notices, ...evidence(root, selfId, "stalled", found.map((stall) => stall.call.since))]);
 	const due = found.filter((stall) => !known.some((notice) => isStallNoticeOf(notice, stall)));
+	const procs = due.some(inBash) ? table() : undefined;
 	const attempts = due.map((stall) => ({
 		child: stall.child,
 		kind: "stalled" as const,
-		result: postNotice(root, selfId, stall.child, { kind: "stalled", life: lifeOf(stall.child), call: stall.call }, stalledText(stall, now), now, stall.call.since),
+		result: postNotice(root, selfId, stall.child, { kind: "stalled", life: lifeOf(stall.child), call: stall.call }, stalledText(stall, now, groupOf(stall, procs, now)), now, stall.call.since),
 	}));
 	return reported(known, attempts);
 };
@@ -131,7 +152,8 @@ const reportStalls = (root: string, selfId: string, children: readonly Presence[
  * and outdated ones (`quick`). Deaths and stalls are reported into your own inbox, where their notices
  * are the evidence they were (by this run or an earlier one, live or not). Stalls are judged only on
  * records this look read: a watched child a quick look didn't reread may show a call that has ended
- * since. A post that fails isn't evidence, so the next full look retries.
+ * since. A post that fails isn't evidence, so the next full look retries. `table` lists the machine's
+ * processes (ps), only for a stall about to be reported on a bash call.
  */
 export const lookAfterChildren = (
 	root: string,
@@ -142,12 +164,13 @@ export const lookAfterChildren = (
 	awakeSince: number,
 	probe: PidProbe = pidAlive,
 	stalledAfterMs = STALLED_AFTER_MS,
+	table: ProcessTable = psTable,
 ): Look => {
 	const look = readSessions(root, scope === "full" ? () => true : filesToRead(watch, now, probe));
 	const judged = watchChildren(childrenAfter(watch.watched, look, selfId), watch.notices, now, awakeSince, probe);
 	const deaths = reportDeaths(root, selfId, judged, watch.notices, now, awakeSince, probe);
 	const read = new Set(look.records.map((record) => record.id));
-	const stalls = reportStalls(root, selfId, judged.watched.filter((child) => read.has(child.id)), deaths.notices, now, awakeSince, stalledAfterMs);
+	const stalls = reportStalls(root, selfId, judged.watched.filter((child) => read.has(child.id)), deaths.notices, now, awakeSince, stalledAfterMs, table);
 	return {
 		watch: { files: look.files, watched: deaths.watched, notices: stalls.notices },
 		records: look.records,

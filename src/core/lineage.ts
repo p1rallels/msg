@@ -1,3 +1,4 @@
+import { groupStopCommand } from "./group.ts";
 import { DELIVERED_TTL_MS } from "./housekeeping.ts";
 import { ago, type Call, clipPreview, elapsed, exactLabel, type Life, MAX_TEXT_BYTES, type Message, partyLabel, type Relation, textBytes } from "./message.ts";
 import { type Env, isValidId } from "./paths.ts";
@@ -231,21 +232,29 @@ export const diedText = (death: Death, now: number): string => {
 
 /**
  * What stops a stalled sub, stuck command and all: SIGTERM to its pi, which kills every command it runs (each
- * leads its own process group, and pi kills the group) and ends, reporting `ended`, stopped.
+ * leads its own process group, and pi kills the group) and ends, reporting `ended`, stopped. To stop just the stuck
+ * command, `groupStopCommand` signals that command's group alone: the call comes back failed and the sub carries on.
  */
 export const stopCommand = (child: Pick<Presence, "pid">): string => `kill ${child.pid}`;
 
 const utc = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 
-/** A stall's message text: what the sub is stuck in, for how long and since when, that it's alive, and how to stop it or leave it. */
-export const stalledText = (stall: Stall, now: number): string => {
+const commandStop = (who: string, group: number): string =>
+	`To stop just that command, run \`${groupStopCommand(group)}\` (its process group): the call comes back failed and ${who} carries on, context intact. To tell it what to do instead, msg_send it first: a busy sub reads your message as soon as its running calls return, before its next step.`;
+
+/**
+ * A stall's message text: what the sub is stuck in, for how long and since when, that it's alive, and how to stop it
+ * or leave it. With the stuck command's process `group`, stopping just that command comes first, then the whole sub.
+ */
+export const stalledText = (stall: Stall, now: number, group?: number): string => {
 	const { child, call } = stall;
 	const who = partyLabel(child);
 	return [
 		`${who} has been stuck in one tool call for ${elapsed(call.since, now)}, since ${utc(call.since)}:`,
 		call.preview === undefined ? call.name : `${call.name}: ${call.preview}`,
 		`It's alive (pid ${child.pid}, last heartbeat ${ago(child.heartbeatAt, now)}) but can't go on until that call returns.`,
-		`To stop it, run \`${stopCommand(child)}\`: pi kills the commands it's running (each one's whole process group) and ends, and ${who} reports ended, stopped, with its last words.`,
+		...(group === undefined ? [] : [commandStop(who, group)]),
+		`${group === undefined ? "To stop it" : `To stop ${who} itself`}, run \`${stopCommand(child)}\`: pi kills the commands it's running (each one's whole process group) and ends, and ${who} reports ended, stopped, with its last words.`,
 		"Or leave it, if that's a legit long command: you won't hear about this call again.",
 	].join("\n");
 };
