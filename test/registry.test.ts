@@ -190,14 +190,15 @@ describe("presence call: the oldest tool call that can stall the session", () =>
 		expect(readPresence(root, "s-2")).toEqual(bare);
 	});
 
-	test("a malformed call is dropped and the record still parses; a long or multi-line preview is clipped to one line", () => {
+	test("a malformed call is dropped and the record still parses; a long or multi-line preview is clipped to one line; a blank id or name is no call", () => {
 		const parsedCall = (value: unknown) => {
 			const result = parsePresence({ ...presence({ id: "s-1" }), call: value });
 			return result.ok ? result.value.call : "invalid";
 		};
-		for (const junk of [null, 42, "bash", [], {}, { ...call, id: "" }, { ...call, name: 7 }, { ...call, since: "5000" }, { id: "c", name: "bash" }]) {
+		for (const junk of [null, 42, "bash", [], {}, { ...call, id: "" }, { ...call, name: 7 }, { ...call, since: "5000" }, { id: "c", name: "bash" }, { ...call, id: "  " }, { ...call, name: " \n\t " }]) {
 			expect(parsedCall(junk)).toBeUndefined();
 		}
+		expect(parsedCall({ ...call, name: "  wait_for\n ci " })).toEqual({ ...call, name: "wait_for ci" });
 		expect(parsedCall({ ...call, preview: 42 })).toEqual({ id: call.id, name: "bash", since: 5_000 });
 		expect(parsedCall({ ...call, preview: "  a\n  b " })).toEqual({ ...call, preview: "a b" });
 		const long = parsedCall({ ...call, preview: "y".repeat(5_000) });

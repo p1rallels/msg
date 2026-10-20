@@ -99,13 +99,16 @@ const makeCall = (id: string, name: string, preview: string | undefined, since: 
 	return { id, name: name.slice(0, MAX_NAME_LENGTH), ...(clipped ? { preview: clipped } : {}), since };
 };
 
-/** A tool call from a record or a message: an id, a name and a start, all required; the preview clipped. Junk is no call. */
+/**
+ * A tool call from a record or a message: an id, a name and a start, all required (a blank id or name is none); the
+ * id kept as is, the name normalized like a session's, the preview clipped. Junk is no call.
+ */
 export const parseCall = (value: unknown): Call | undefined => {
 	if (!isRecord(value)) return undefined;
 	const id = optionalString(value.id);
-	const name = optionalString(value.name);
+	const name = normalizeName(optionalString(value.name));
 	const since = optionalNumber(value.since);
-	if (!id || !name || since === undefined) return undefined;
+	if (!id?.trim() || !name || since === undefined) return undefined;
 	return makeCall(id, name, optionalString(value.preview), since);
 };
 
