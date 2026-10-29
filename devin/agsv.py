@@ -396,7 +396,7 @@ def post(store, msg: dict) -> dict:
 
 def devin_wake(agent_id: str, text: str) -> bool:
     """With DEVIN_API_KEY, a message to the Devin session itself: a sleeping session wakes for it."""
-    key, org = os.environ.get("DEVIN_API_KEY"), os.environ.get("DEVIN_ORG_ID")
+    key, org = os.environ.get("AGSV_DEVIN_TOKEN") or os.environ.get("DEVIN_API_KEY"), os.environ.get("DEVIN_ORG_ID")
     if not key or not agent_id.startswith("devin-"):
         return False
     url = (f"https://api.devin.ai/v3/organizations/{org}/sessions/{agent_id}/messages" if org  # PAT / service user
