@@ -716,7 +716,7 @@ def incidents(agents: dict, now: int, dead_after_s: int = DEAD_AFTER_S, stall_af
             continue
         if not is_live(a, now, dead_after_s):
             out.append({"key": f"died:{a['id']}:{a.get('heartbeatAt')}", "kind": "died", "about": a["id"], "text": died_text(agents, a, now)})
-        elif a.get("status") == "working" and now - a.get("progressAt", now) > stall_after_s * 1000:
+        elif a.get("status") == "working" and a.get("role") != "coordinator" and now - a.get("progressAt", now) > stall_after_s * 1000:
             out.append({"key": f"stalled:{a['id']}:{a.get('progressAt')}", "kind": "stalled", "about": a["id"], "text": stalled_text(a, now)})
     edges = wait_edges(agents, now)
     for e in edges:
@@ -742,7 +742,7 @@ def supervise_once(store, coordinator: str, seen: set[str], now: Optional[int] =
         recipients = {coordinator} | (set(inc["about"]) if inc["kind"] == "deadlock" else set())
         for to in recipients:
             post(store, make_message(SUPERVISOR, to, inc["text"], kind=inc["kind"], about={"id": inc["about"], "key": inc["key"]}))
-            devin_wake(to, f"[agsv supervisor] {clip(inc['text'], 1200)}")
+            devin_wake(to, "[agsv supervisor] " + inc["text"][:1200])
         seen.add(inc["key"])
         store.create(f"incidents/{hashlib.sha1(inc['key'].encode()).hexdigest()[:16]}.json", {**inc, "at": now, "sentTo": sorted(recipients)})
         fresh.append(inc)
