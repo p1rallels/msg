@@ -40,6 +40,7 @@ HEARTBEAT_S = 20
 DEAD_AFTER_S = 90
 STALL_AFTER_S = 600
 POLL_S = 3
+MAX_POLL_S = 30
 MAX_TEXT = 64 * 1024
 MAX_NAME = 64
 PREVIEW = 100
@@ -131,6 +132,9 @@ class GitHubStore:
             except urllib.error.HTTPError as e:
                 if e.code in (404, 409, 422):
                     return e.code, None
+                if e.code == 403 and e.headers.get("x-ratelimit-remaining") == "0":
+                    reset = int(e.headers.get("x-ratelimit-reset", "0"))
+                    raise SystemExit(f"agsv: GitHub API quota exhausted for this account; resets at {utc(reset * 1000)} ({max(0, reset - int(time.time())) // 60} min).")
                 if e.code == 401 and attempt < 3:  # the token a long-lived process holds can expire; ask gh for a fresh one
                     self._token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip()
                     req.add_header("Authorization", f"Bearer {self._token}")
@@ -540,6 +544,7 @@ def recv(store, me: dict, wait_s: int = 0, poll_s: float = POLL_S) -> list[dict]
             heartbeat_once(store, me["id"])
             last_beat = now_ms()
         time.sleep(poll_s)
+        poll_s = min(poll_s * 1.5, MAX_POLL_S)  # a long wait must not eat the GitHub API quota a fleet shares
     if not mail:
         print("no new mail.")
         return []
