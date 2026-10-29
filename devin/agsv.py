@@ -131,6 +131,11 @@ class GitHubStore:
             except urllib.error.HTTPError as e:
                 if e.code in (404, 409, 422):
                     return e.code, None
+                if e.code == 401 and attempt < 3:  # the token a long-lived process holds can expire; ask gh for a fresh one
+                    self._token = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, check=True).stdout.strip()
+                    req.add_header("Authorization", f"Bearer {self._token}")
+                    time.sleep(1 + attempt)
+                    continue
                 if e.code in (500, 502, 503) and attempt < 3:
                     time.sleep(1 + attempt)
                     continue
