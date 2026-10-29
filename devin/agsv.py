@@ -749,13 +749,28 @@ def supervise_once(store, coordinator: str, seen: set[str], now: Optional[int] =
     return fresh
 
 
+def relay_to_chat(coordinator: str, m: dict) -> None:
+    """Children hold no Devin credentials; the supervisor posts their mail into the parent's session for them."""
+    who, kind = m.get("from", {}).get("name", "?"), m.get("kind")
+    verb = {"ended": "done" if not (m.get("about") or {}).get("failed") else "failed"}.get(kind, "says")
+    if devin_wake(coordinator, f"[agsv] {who} {verb}: {clip(m.get('text', ''), 400)} — `agsv recv` for the full message."):
+        print(f"{utc(now_ms())} relayed {kind or 'message'} from {who} to the coordinator's chat", flush=True)
+
+
 def supervise(store, coordinator: str, interval_s: float = 10, dead_after_s: int = DEAD_AFTER_S, stall_after_s: int = STALL_AFTER_S) -> None:
     seen = {i.get("key") for i in store.snapshot("incidents/").values() if isinstance(i, dict)}
+    relayed = set(store.snapshot(inbox_dir(coordinator) + "/"))
     print(f"{utc(now_ms())} supervising for {coordinator}; {len(seen)} past incidents on record", flush=True)
     while True:
         try:
             for inc in supervise_once(store, coordinator, seen, None, dead_after_s, stall_after_s):
                 print(f"{utc(now_ms())} {inc['kind']}: {inc['text'].splitlines()[0]}", flush=True)
+            for path, m in sorted(store.snapshot(inbox_dir(coordinator) + "/").items()):
+                if path in relayed or not isinstance(m, dict):
+                    continue
+                relayed.add(path)
+                if m.get("from", {}).get("id") != SUPERVISOR["id"]:
+                    relay_to_chat(coordinator, m)
         except Exception as e:
             print(f"{utc(now_ms())} tick failed: {e}", flush=True)
         time.sleep(interval_s)
