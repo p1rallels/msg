@@ -153,10 +153,15 @@ class GitHubStore:
                 "content": base64.b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode()}
         if sha:
             body["sha"] = sha
-        status, res = self._req("PUT", f"contents/{path}", body)
-        if status in (409, 422) or not res:
-            raise Conflict(path)
-        return res["content"]["sha"]
+        for attempt in range(6):
+            status, res = self._req("PUT", f"contents/{path}", body)
+            if status == 409 and attempt < 5:
+                time.sleep(0.5 + attempt + random.random())
+                continue
+            if status in (409, 422) or not res:
+                raise Conflict(path)
+            return res["content"]["sha"]
+        raise Conflict(path)
 
     def create(self, path: str, obj: Any) -> bool:
         try:
@@ -732,11 +737,11 @@ def supervise_once(store, coordinator: str, seen: set[str], now: Optional[int] =
     for inc in incidents(agents, now, dead_after_s, stall_after_s):
         if inc["key"] in seen:
             continue
-        seen.add(inc["key"])
         recipients = {coordinator} | (set(inc["about"]) if inc["kind"] == "deadlock" else set())
         for to in recipients:
             post(store, make_message(SUPERVISOR, to, inc["text"], kind=inc["kind"], about={"id": inc["about"], "key": inc["key"]}))
             devin_wake(to, f"agsv supervisor: {inc['kind']} notice. Run `agsv recv`.")
+        seen.add(inc["key"])
         store.create(f"incidents/{hashlib.sha1(inc['key'].encode()).hexdigest()[:16]}.json", {**inc, "at": now, "sentTo": sorted(recipients)})
         fresh.append(inc)
     return fresh
