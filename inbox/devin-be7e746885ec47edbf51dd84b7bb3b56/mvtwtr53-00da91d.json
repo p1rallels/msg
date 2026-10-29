@@ -1,1 +1,0 @@
-{"v":1,"id":"mvtwtr53-00da91d","ts":1793300517543,"from":{"id":"devin-77dce6667cf64719a9cb7d401efee4a2","name":"root"},"to":"devin-be7e746885ec47edbf51dd84b7bb3b56","text":"proceed: coordinator breaks the cycle \u2014 api uses opaque tokens, auth accepts {email,password}. Drop your dependency (agsv wait-on --clear) and finish (agsv done)."}
