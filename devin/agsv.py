@@ -394,6 +394,16 @@ def post(store, msg: dict) -> dict:
     return msg
 
 
+ICON = {"says": "💬", "done": "✅", "failed": "❌", "deadlock": "🔒", "died": "💀", "stalled": "⏳", "blocked": "🚫", "ended": "✅"}
+
+
+def chat_note(who: str, verb: str, text: str, hint: str = "`agsv recv` for the full message") -> str:
+    """Markdown for a Devin chat: one bold line saying who and what, the body quoted, a small hint."""
+    body = text.strip()
+    quoted = "\n```\n" + body[:1500] + "\n```" if "\n" in body else f" {clip(body, 400)}"
+    return f"{ICON.get(verb, '📨')} **{who}** · {verb}:{quoted}\n_{hint}_"
+
+
 def devin_wake(agent_id: str, text: str) -> bool:
     """With DEVIN_API_KEY, a message to the Devin session itself: a sleeping session wakes for it."""
     key, org = os.environ.get("AGSV_DEVIN_TOKEN") or os.environ.get("DEVIN_API_KEY"), os.environ.get("DEVIN_ORG_ID")
@@ -486,7 +496,7 @@ def send(store, me: dict, to: str, text: str, reply_to: Optional[str] = None, wa
             raise
     msg = post(store, make_message(me, target, text, reply_to, deadline if wait_s else None))
     name = agents.get(target, {}).get("name", target)
-    devin_wake(target, f"[agsv] {me.get('name', me['id'])} says: {clip(text, 400)}" + (" (waiting for your reply: `agsv send parent ...`)" if wait_s else "") + " — `agsv recv` for the full message.")
+    devin_wake(target, chat_note(me.get("name", me["id"]), "says", text, "waiting for your reply: `agsv send parent \"...\"`" if wait_s else "`agsv recv` for the full message"))
     if not wait_s:
         print(f"sent {msg['id']} to {name} ({target})")
         return None
@@ -546,7 +556,7 @@ def done(store, me: dict, report: str, failed: bool = False, result: Optional[di
     recipients = {record.get("parent")} | {a["id"] for a in agents.values() if any(w["on"] == me["id"] for w in a.get("waits", []))}
     for to in filter(None, recipients):
         post(store, make_message(me, to, text, kind="ended", about={"id": me["id"], "failed": failed, **({"result": result} if result is not None else {})}))
-        devin_wake(to, f"[agsv] {me.get('name', me['id'])} {'failed' if failed else 'done'}: {clip(report, 400)} — `agsv recv` for the full report.")
+        devin_wake(to, chat_note(me.get("name", me["id"]), "failed" if failed else "done", report, "`agsv recv` for the full report"))
     stop_heartbeat()
     print(f"ended; report sent to {', '.join(sorted(filter(None, recipients))) or 'nobody'}.")
 
@@ -742,7 +752,7 @@ def supervise_once(store, coordinator: str, seen: set[str], now: Optional[int] =
         recipients = {coordinator} | (set(inc["about"]) if inc["kind"] == "deadlock" else set())
         for to in recipients:
             post(store, make_message(SUPERVISOR, to, inc["text"], kind=inc["kind"], about={"id": inc["about"], "key": inc["key"]}))
-            devin_wake(to, "[agsv supervisor] " + inc["text"][:1200])
+            devin_wake(to, chat_note("supervisor", inc["kind"], inc["text"], "from the agsv runtime, not your user; reported once"))
         seen.add(inc["key"])
         store.create(f"incidents/{hashlib.sha1(inc['key'].encode()).hexdigest()[:16]}.json", {**inc, "at": now, "sentTo": sorted(recipients)})
         fresh.append(inc)
@@ -753,7 +763,7 @@ def relay_to_chat(coordinator: str, m: dict) -> None:
     """Children hold no Devin credentials; the supervisor posts their mail into the parent's session for them."""
     who, kind = m.get("from", {}).get("name", "?"), m.get("kind")
     verb = {"ended": "done" if not (m.get("about") or {}).get("failed") else "failed"}.get(kind, "says")
-    if devin_wake(coordinator, f"[agsv] {who} {verb}: {clip(m.get('text', ''), 400)} — `agsv recv` for the full message."):
+    if devin_wake(coordinator, chat_note(who, verb, m.get("text", ""))):
         print(f"{utc(now_ms())} relayed {kind or 'message'} from {who} to the coordinator's chat", flush=True)
 
 
