@@ -79,7 +79,7 @@ Break it: pick one edge and resolve it from outside …
 ### Waking a sleeping session
 
 Without a key, an agent waits by blocking in `agsv recv --wait N` (alive, heartbeating). With
-`DEVIN_API_KEY` set where `agsv` runs, every delivery also posts a one-line note to the recipient's
+`DEVIN_API_KEY` + `DEVIN_ORG_ID` set where `agsv` runs, every delivery also posts a one-line note to the recipient's
 Devin session through the API, so a session that went to sleep wakes up for it — the parent really
 stops thinking while its workers run.
 

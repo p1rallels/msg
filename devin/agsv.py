@@ -396,10 +396,12 @@ def post(store, msg: dict) -> dict:
 
 def devin_wake(agent_id: str, text: str) -> bool:
     """With DEVIN_API_KEY, a message to the Devin session itself: a sleeping session wakes for it."""
-    key = os.environ.get("DEVIN_API_KEY")
+    key, org = os.environ.get("DEVIN_API_KEY"), os.environ.get("DEVIN_ORG_ID")
     if not key or not agent_id.startswith("devin-"):
         return False
-    req = urllib.request.Request(f"https://api.devin.ai/v1/session/{agent_id}/message", data=json.dumps({"message": text}).encode(), method="POST",
+    url = (f"https://api.devin.ai/v3/organizations/{org}/sessions/{agent_id}/messages" if org  # PAT / service user
+           else f"https://api.devin.ai/v1/session/{agent_id}/message")  # legacy API key
+    req = urllib.request.Request(url, data=json.dumps({"message": text}).encode(), method="POST",
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "agsv"})
     try:
         with urllib.request.urlopen(req, timeout=20):
