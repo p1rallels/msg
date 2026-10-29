@@ -486,7 +486,7 @@ def send(store, me: dict, to: str, text: str, reply_to: Optional[str] = None, wa
             raise
     msg = post(store, make_message(me, target, text, reply_to, deadline if wait_s else None))
     name = agents.get(target, {}).get("name", target)
-    devin_wake(target, f"agsv: new message from {me.get('name', me['id'])}. Run `agsv recv` to read it." + (" It is waiting for your reply." if wait_s else ""))
+    devin_wake(target, f"[agsv] {me.get('name', me['id'])} says: {clip(text, 400)}" + (" (waiting for your reply: `agsv send parent ...`)" if wait_s else "") + " — `agsv recv` for the full message.")
     if not wait_s:
         print(f"sent {msg['id']} to {name} ({target})")
         return None
@@ -546,7 +546,7 @@ def done(store, me: dict, report: str, failed: bool = False, result: Optional[di
     recipients = {record.get("parent")} | {a["id"] for a in agents.values() if any(w["on"] == me["id"] for w in a.get("waits", []))}
     for to in filter(None, recipients):
         post(store, make_message(me, to, text, kind="ended", about={"id": me["id"], "failed": failed, **({"result": result} if result is not None else {})}))
-        devin_wake(to, f"agsv: {me.get('name', me['id'])} ended. Run `agsv recv` for its report.")
+        devin_wake(to, f"[agsv] {me.get('name', me['id'])} {'failed' if failed else 'done'}: {clip(report, 400)} — `agsv recv` for the full report.")
     stop_heartbeat()
     print(f"ended; report sent to {', '.join(sorted(filter(None, recipients))) or 'nobody'}.")
 
@@ -742,7 +742,7 @@ def supervise_once(store, coordinator: str, seen: set[str], now: Optional[int] =
         recipients = {coordinator} | (set(inc["about"]) if inc["kind"] == "deadlock" else set())
         for to in recipients:
             post(store, make_message(SUPERVISOR, to, inc["text"], kind=inc["kind"], about={"id": inc["about"], "key": inc["key"]}))
-            devin_wake(to, f"agsv supervisor: {inc['kind']} notice. Run `agsv recv`.")
+            devin_wake(to, f"[agsv supervisor] {clip(inc['text'], 1200)}")
         seen.add(inc["key"])
         store.create(f"incidents/{hashlib.sha1(inc['key'].encode()).hexdigest()[:16]}.json", {**inc, "at": now, "sentTo": sorted(recipients)})
         fresh.append(inc)
