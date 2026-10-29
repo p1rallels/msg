@@ -405,7 +405,7 @@ ICON = {"says": "💬", "done": "✅", "failed": "❌", "deadlock": "🔒", "die
 def chat_note(who: str, verb: str, text: str, hint: str = "`agsv recv` for the full message") -> str:
     """Markdown for a Devin chat: one bold line saying who and what, the body quoted, a small hint."""
     body = text.strip()
-    quoted = "\n```\n" + body[:1500] + "\n```" if "\n" in body else f" {clip(body, 400)}"
+    quoted = "\n```\n" + body[:6000] + "\n```" if "\n" in body else f" {clip(body, 400)}"
     return f"{ICON.get(verb, '📨')} **{who}** · {verb}:{quoted}\n_{hint}_"
 
 
